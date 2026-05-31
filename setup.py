@@ -33,6 +33,7 @@ if cuda_available():
             sources=[
                 "csrc/add_tensors.cu",
                 "csrc/fused_norm.cu",
+                "csrc/decode_attention.cu",
             ],
             include_dirs=["csrc"],
             extra_compile_args={
