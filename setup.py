@@ -32,6 +32,7 @@ if cuda_available():
             name="mini_llm_kernels._C",
             sources=[
                 "csrc/add_tensors.cu",
+                "csrc/fused_norm.cu",
             ],
             include_dirs=["csrc"],
             extra_compile_args={
