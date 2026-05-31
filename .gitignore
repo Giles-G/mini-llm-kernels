@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# CUDA build artifacts
+*.o
+*.so
+*.a
+csrc/__pycache__/
+
+# IDE
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
