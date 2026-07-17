@@ -1,0 +1,7 @@
+CompileFlags:
+  Add:
+    - "-I/Users/gengzhiqiang/Library/Python/3.9/lib/python/site-packages/torch/include"
+    - "-I/Users/gengzhiqiang/Library/Python/3.9/lib/python/site-packages/torch/include/torch/csrc/api/include"
+Diagnostics:
+  Suppress:
+    - pp_file_not_found

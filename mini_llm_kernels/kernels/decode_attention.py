@@ -70,9 +70,11 @@ def _decode_paged_attention_pytorch(
 # 运行时选择
 try:
     from mini_llm_kernels._C import decode_paged_attention as _cuda_decode_paged_attn
+    from mini_llm_kernels._C import decode_paged_attention_partitioned as _cuda_decode_partitioned
     _HAS_DECODE_ATTN = True
 except ImportError:
     _HAS_DECODE_ATTN = False
+    _cuda_decode_partitioned = None
 
 
 def decode_paged_attention(
@@ -82,9 +84,16 @@ def decode_paged_attention(
     block_table: torch.Tensor,
     context_lens: torch.Tensor,
 ) -> torch.Tensor:
-    """Block-aware decode attention（paged KV，online softmax）"""
+    """Block-aware decode attention (paged KV, online softmax).
+
+    Automatically uses KV-sequence-partitioned kernel when batch=1 for
+    better SM utilization on GPUs with many SMs (e.g., RTX 3060).
+    """
     if _HAS_DECODE_ATTN and q.is_cuda:
         ctx_int32 = context_lens.to(torch.int32)
         bt_int32  = block_table.to(torch.int32)
+        # P4: For small batches, use KV-partitioned kernel to fill more SMs
+        if q.size(0) == 1 and _cuda_decode_partitioned is not None:
+            return _cuda_decode_partitioned(q, k_cache, v_cache, bt_int32, ctx_int32, 2)
         return _cuda_decode_paged_attn(q, k_cache, v_cache, bt_int32, ctx_int32)
     return _decode_paged_attention_pytorch(q, k_cache, v_cache, block_table, context_lens)

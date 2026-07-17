@@ -70,16 +70,21 @@ __global__ void fused_add_rms_norm_kernel(
     T*       out_row      = x_normed     + row * H;
     T*       res_out_row  = residual_out + row * H;
 
-    // ── Step 1: residual_out = x + residual，同时累积 sum(val²) ──
+    // ── shared memory: warp reduce + val buffer ──
+    extern __shared__ float smem[];  // [num_warps + H]
+    float* reduce_smem = smem;               // [0 .. num_warps-1]
+    float* val_smem     = smem + num_warps;  // [num_warps .. num_warps+H-1]
+
+    // ── Step 1: residual_out = x + residual，同时累积 sum(val²) 并保存 val ──
     float sum_sq = 0.0f;
     for (int i = threadIdx.x; i < H; i += blockDim.x) {
         float val = to_float(x_row[i]) + to_float(res_row[i]);
-        // 直接写 residual_out（稍后 normalize 时再读 residual_out）
         if constexpr (std::is_same_v<T, __half>) {
             res_out_row[i] = from_float_half(val);
         } else {
             res_out_row[i] = from_float_bf16(val);
         }
+        val_smem[i] = val;  // 保存到 shared memory，避免 Step 4 重复读 HBM
         sum_sq += val * val;
     }
 
@@ -90,30 +95,29 @@ __global__ void fused_add_rms_norm_kernel(
 
     // 需要跨 warp reduce（当 blockDim.x > 32 时）
     // 用 shared memory 聚合各 warp 的结果
-    extern __shared__ float smem[];  // 大小 = num_warps
     int warp_id = threadIdx.x / 32;
     int lane_id = threadIdx.x % 32;
     int num_warps = (blockDim.x + 31) / 32;
 
-    if (lane_id == 0) smem[warp_id] = sum_sq;
+    if (lane_id == 0) reduce_smem[warp_id] = sum_sq;
     __syncthreads();
 
     // 只有第 0 个 warp 做最终 reduce
     if (warp_id == 0) {
-        sum_sq = (lane_id < num_warps) ? smem[lane_id] : 0.0f;
+        sum_sq = (lane_id < num_warps) ? reduce_smem[lane_id] : 0.0f;
         for (int offset = 16; offset > 0; offset >>= 1)
             sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, offset);
-        if (lane_id == 0) smem[0] = sum_sq;
+        if (lane_id == 0) reduce_smem[0] = sum_sq;
     }
     __syncthreads();
-    sum_sq = smem[0];
+    sum_sq = reduce_smem[0];
 
     // ── Step 3: RMS = 1 / sqrt(mean(x²) + eps) ──
     float rms_scale = rsqrtf(sum_sq / H + eps);
 
-    // ── Step 4: normalize + scale → x_normed ──
+    // ── Step 4: normalize + scale → x_normed（从 shared memory 读 val，避免重复 HBM 读） ──
     for (int i = threadIdx.x; i < H; i += blockDim.x) {
-        float normed = to_float(res_out_row[i]) * rms_scale * to_float(gamma[i]);
+        float normed = val_smem[i] * rms_scale * to_float(gamma[i]);
         if constexpr (std::is_same_v<T, __half>) {
             out_row[i] = from_float_half(normed);
         } else {
@@ -166,7 +170,7 @@ std::pair<torch::Tensor, torch::Tensor> fused_add_rms_norm(
     // 向上对齐到 32（warp 大小）
     threads = ((threads + 31) / 32) * 32;
     int num_warps = threads / 32;
-    int smem_bytes = num_warps * sizeof(float);
+    int smem_bytes = (num_warps + H) * sizeof(float);  // reduce + val buffer
 
     if (x.dtype() == torch::kFloat16) {
         fused_add_rms_norm_kernel<__half><<<N, threads, smem_bytes>>>(
