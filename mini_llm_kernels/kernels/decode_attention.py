@@ -32,8 +32,10 @@ def _decode_paged_attention_pytorch(
     N, H_q, D = q.shape
     block_size = k_cache.size(1)
     H_kv = k_cache.size(2)
-    max_ctx = int(context_lens.max().item())
     max_blocks = block_table.size(1)
+    # 使用 block_table 容量作为 max_ctx 上界，避免 .item() 触发 CPU-GPU sync
+    # （这对 CUDA graph capture 是必需的）
+    max_ctx = max_blocks * block_size
 
     # 构造 gather 索引（与 KVCacheManager.gather_kv_decode_batch 等价）
     pos = torch.arange(max_ctx, device=q.device, dtype=torch.long)
@@ -97,6 +99,7 @@ def decode_paged_attention(
             if q.size(0) == 1 and _cuda_decode_partitioned is not None:
                 return _cuda_decode_partitioned(q, k_cache, v_cache, bt_int32, ctx_int32, 2)
             return _cuda_decode_paged_attn(q, k_cache, v_cache, bt_int32, ctx_int32)
-        except Exception:
-            pass  # fall through to PyTorch fallback
+        except Exception as e:
+            import warnings
+            warnings.warn(f"CUDA decode_attention kernel failed, falling back to PyTorch: {e}")
     return _decode_paged_attention_pytorch(q, k_cache, v_cache, block_table, context_lens)
