@@ -76,8 +76,9 @@ __global__ void int4_dequant_matmul_kernel(
 
     // ── registers: accumulator ──
     float acc[2] = {0.0f, 0.0f};
+    // Each thread owns one output dimension. The packed row stores two
+    // output dimensions, but that packing is only a storage format.
     int out0 = tid;          // 0..127
-    int out1 = tid + 64;     // 64..191 (may exceed N_THIS)
 
     // ── iterate over K ──
     for (int k_start = 0; k_start < K; k_start += K_TILE) {
@@ -89,8 +90,9 @@ __global__ void int4_dequant_matmul_kernel(
         for (int i = tid; i < N_THIS * k_bytes; i += blockDim.x) {
             int out_off = i / k_bytes;
             int k_off   = i % k_bytes;
-            int out_row = N_START + out_off;
-            smem_w[out_off][k_off] = w_packed[(out_row / 2) * K + (k_start / 2) + k_off];
+            // Each thread handles one output row; packed rows contain two output rows.
+            int packed_row = (N_START + out_off) / 2;
+            smem_w[out_off][k_off] = w_packed[packed_row * K + (k_start / 2) + k_off];
         }
         __syncthreads();
 
@@ -113,7 +115,7 @@ __global__ void int4_dequant_matmul_kernel(
                 float xa = _to_float(x_ptr[k_start + k_base]);
                 float xb = _to_float(x_ptr[k_start + k_base + 1]);
 
-                // Unpack 2 INT4 weights for out0 and out1
+                // Unpack the selected output row's two consecutive K values.
                 uint8_t w_byte0 = smem_w[out0][k_idx];
                 int w0_low  = (int)(w_byte0 & 0x0F) - 8;
                 int w0_high = (int)(w_byte0 >> 4)   - 8;
@@ -125,35 +127,18 @@ __global__ void int4_dequant_matmul_kernel(
                 float w0a = (float)w0_low  * s0;
                 float w0b = (float)w0_high * s0;
 
-                float w1a = 0.0f, w1b = 0.0f;
-                if (out1 < N_THIS) {
-                    uint8_t w_byte1 = smem_w[out1][k_idx];
-                    int w1_low  = (int)(w_byte1 & 0x0F) - 8;
-                    int w1_high = (int)(w_byte1 >> 4)   - 8;
-                    float s1 = _to_float(group_scales[(N_START + out1) * (K / group_size) + g_idx]);
-                    w1a = (float)w1_low  * s1;
-                    w1b = (float)w1_high * s1;
-                }
-
                 acc[0] += xa * w0a + xb * w0b;
-                if (out1 < N_THIS)
-                    acc[1] += xa * w1a + xb * w1b;
             }
         }
         __syncthreads();
     }
 
     // ── warp reduce (dot partial sums from different threads) ──
-    // Each thread computed partial dot for 2 outputs; they are NOT shared
-    // across threads because each thread handles different output dims.
-    // Warp reduce is needed only if multiple threads contribute to one output.
-    // With current layout: 1 thread = 2 outputs, no sharing. Skip reduce.
+    // Each thread owns one output row, so no cross-thread reduction is needed.
 
     // ── write output ──
     if (out0 < N_THIS)
         y_ptr[out0] = _from_float<T>(acc[0]);
-    if (out1 < N_THIS)
-        y_ptr[out1] = _from_float<T>(acc[1]);
 }
 
 // ───────────────────────────────────────────────────────────────────
@@ -182,6 +167,8 @@ torch::Tensor int4_dequant_matmul(
 
     TORCH_CHECK(x.numel() == batch_elems * K, "x shape mismatch");
     TORCH_CHECK(w_packed.size(1) == K, "w_packed K dim must match x last dim");
+    // The packed storage is [N/2, K], while group scales stay [N, K/groups].
+    TORCH_CHECK(w_packed.size(0) * 2 == N, "packed weight row count mismatch");
     TORCH_CHECK(group_scales.size(0) == N, "group_scales N must match unpacked N");
     TORCH_CHECK(group_scales.size(1) == (K + group_size - 1) / group_size,
                 "group_scales K dim mismatch");

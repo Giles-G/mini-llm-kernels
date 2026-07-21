@@ -34,9 +34,10 @@ def _int4_dequant_matmul_pytorch(
     w_q[0::2] = w_low
     w_q[1::2] = w_high
 
-    # Determine group_size from shapes
     group_size = K // group_scales.shape[1]
-    if N != group_scales.shape[0]:
+    if K % group_scales.shape[1] != 0:
+        raise ValueError("K must be divisible by the number of scale groups")
+    if group_scales.shape[0] != N:
         raise ValueError(
             f"group_scales N={group_scales.shape[0]} != unpacked N={N}"
         )
