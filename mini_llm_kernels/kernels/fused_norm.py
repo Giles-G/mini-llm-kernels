@@ -57,6 +57,6 @@ def fused_add_rms_norm(
     Returns:
         (x_normed, residual_out)
     """
-    if _HAS_FUSED_NORM and x.is_cuda:
+    if _HAS_FUSED_NORM and x.is_cuda and residual.is_cuda and gamma.is_cuda:
         return _cuda_fused_add_rms_norm(x, residual, gamma, eps)
     return _fused_add_rms_norm_pytorch(x, residual, gamma, eps)
