@@ -164,7 +164,7 @@ torch::Tensor int4_dequant_matmul(
     int64_t batch_elems = 1;
     for (int64_t d = 0; d < (int64_t)orig_shape.size() - 1; d++)
         batch_elems *= orig_shape[d];
-    int K = orig_shape.back().as_int().value_or(0);
+    int K = (int)orig_shape.back();
     int N = w_packed.size(0) * 2;  // 2 output dims per packed row
 
     TORCH_CHECK(x.numel() == batch_elems * K, "x shape mismatch");
