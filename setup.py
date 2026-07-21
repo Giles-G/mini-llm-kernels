@@ -34,6 +34,7 @@ if cuda_available():
                 "csrc/add_tensors.cu",
                 "csrc/fused_norm.cu",
                 "csrc/decode_attention.cu",
+                "csrc/int4_matmul.cu",
             ],
             include_dirs=["csrc"],
             extra_compile_args={
