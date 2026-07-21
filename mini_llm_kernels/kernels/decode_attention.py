@@ -92,8 +92,11 @@ def decode_paged_attention(
     if _HAS_DECODE_ATTN and q.is_cuda:
         ctx_int32 = context_lens.to(torch.int32)
         bt_int32  = block_table.to(torch.int32)
-        # P4: For small batches, use KV-partitioned kernel to fill more SMs
-        if q.size(0) == 1 and _cuda_decode_partitioned is not None:
-            return _cuda_decode_partitioned(q, k_cache, v_cache, bt_int32, ctx_int32, 2)
-        return _cuda_decode_paged_attn(q, k_cache, v_cache, bt_int32, ctx_int32)
+        try:
+            # P4: For small batches, use KV-partitioned kernel to fill more SMs
+            if q.size(0) == 1 and _cuda_decode_partitioned is not None:
+                return _cuda_decode_partitioned(q, k_cache, v_cache, bt_int32, ctx_int32, 2)
+            return _cuda_decode_paged_attn(q, k_cache, v_cache, bt_int32, ctx_int32)
+        except Exception:
+            pass  # fall through to PyTorch fallback
     return _decode_paged_attention_pytorch(q, k_cache, v_cache, block_table, context_lens)
