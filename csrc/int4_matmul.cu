@@ -25,7 +25,19 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <torch/extension.h>
+
+// type conversion helpers (templated for fp16 / bf16)
+template<typename T>
+__device__ __forceinline__ float _to_float(T v);
+template<> __device__ __forceinline__ float _to_float(__half v)         { return __half2float(v); }
+template<> __device__ __forceinline__ float _to_float(__nv_bfloat16 v)  { return __bfloat162float(v); }
+
+template<typename T>
+__device__ __forceinline__ T _from_float(float v);
+template<> __device__ __forceinline__ __half        _from_float<__half>(float v)        { return __float2half(v); }
+template<> __device__ __forceinline__ __nv_bfloat16 _from_float<__nv_bfloat16>(float v) { return __float2bfloat16(v); }
 
 // warp reduce helpers (inline in this file to avoid extra dependency)
 __device__ __forceinline__ float _warp_reduce_sum(float v) {
@@ -86,7 +98,6 @@ __global__ void int4_dequant_matmul_kernel(
         // ---- load x for this K tile (fp16 → float, per element) ----
         // ---- compute dot products ----
         for (int kb = 0; kb < k_bytes; kb += 4) {
-            int k0 = kb * 2;  // K dim index
             int k_limit = min(4, k_bytes - kb);  // bytes to process
 
             #pragma unroll
@@ -96,9 +107,9 @@ __global__ void int4_dequant_matmul_kernel(
 
                 if (k_base + 1 >= K_THIS) break;
 
-                // Load 2 activation values (fp16 → float)
-                float xa = __half2float(x_ptr[k_start + k_base]);
-                float xb = __half2float(x_ptr[k_start + k_base + 1]);
+                // Load 2 activation values (fp16/bf16 → float)
+                float xa = _to_float(x_ptr[k_start + k_base]);
+                float xb = _to_float(x_ptr[k_start + k_base + 1]);
 
                 // Unpack 2 INT4 weights for out0 and out1
                 uint8_t w_byte0 = smem_w[out0][k_idx];
@@ -107,7 +118,7 @@ __global__ void int4_dequant_matmul_kernel(
 
                 // Group scale
                 int g_idx = (k_start + k_base) / group_size;
-                float s0 = __half2float(group_scales[out0 * (K / group_size) + g_idx]);
+                float s0 = _to_float(group_scales[out0 * (K / group_size) + g_idx]);
 
                 float w0a = (float)w0_low  * s0;
                 float w0b = (float)w0_high * s0;
@@ -117,7 +128,7 @@ __global__ void int4_dequant_matmul_kernel(
                     uint8_t w_byte1 = smem_w[out1][k_idx];
                     int w1_low  = (int)(w_byte1 & 0x0F) - 8;
                     int w1_high = (int)(w_byte1 >> 4)   - 8;
-                    float s1 = __half2float(group_scales[out1 * (K / group_size) + g_idx]);
+                    float s1 = _to_float(group_scales[out1 * (K / group_size) + g_idx]);
                     w1a = (float)w1_low  * s1;
                     w1b = (float)w1_high * s1;
                 }
@@ -138,9 +149,9 @@ __global__ void int4_dequant_matmul_kernel(
 
     // ── write output ──
     if (out0 < N_THIS)
-        y_ptr[out0] = __float2half(acc[0]);
+        y_ptr[out0] = _from_float<T>(acc[0]);
     if (out1 < N_THIS)
-        y_ptr[out1] = __float2half(acc[1]);
+        y_ptr[out1] = _from_float<T>(acc[1]);
 }
 
 // ───────────────────────────────────────────────────────────────────

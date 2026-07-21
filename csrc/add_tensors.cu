@@ -30,9 +30,9 @@ torch::Tensor add_tensors(torch::Tensor a, torch::Tensor b) {
     TORCH_CHECK(a.dtype() == torch::kFloat32, "only float32 supported");
 
     auto out = torch::empty_like(a);
-    int n = a.numel();
+    int64_t n = a.numel();
     int threads = 256;
-    int blocks = (n + threads - 1) / threads;
+    int64_t blocks = (n + threads - 1) / threads;
 
     add_tensors_kernel<<<blocks, threads>>>(
         a.data_ptr<float>(),
