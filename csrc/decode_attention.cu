@@ -283,6 +283,7 @@ torch::Tensor decode_paged_attention(
 
     TORCH_CHECK(H_q % H_kv == 0, "H_q must be divisible by H_kv (GQA)");
     TORCH_CHECK(D <= MAX_BLOCK_DIM * 4, "head_dim too large (max 512)");
+    TORCH_CHECK(D % 8 == 0, "head_dim must be divisible by 8 (float4 alignment)");
 
     float scale = 1.0f / sqrtf((float)D);
 
@@ -527,6 +528,7 @@ torch::Tensor decode_paged_attention_partitioned(
 
     TORCH_CHECK(H_q % H_kv == 0, "H_q must be divisible by H_kv (GQA)");
     TORCH_CHECK(D <= MAX_BLOCK_DIM * 4, "head_dim too large");
+    TORCH_CHECK(D % 8 == 0, "head_dim must be divisible by 8 (float4 alignment)");
 
     float scale = 1.0f / sqrtf((float)D);
 

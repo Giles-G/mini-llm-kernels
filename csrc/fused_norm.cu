@@ -70,6 +70,8 @@ __global__ void fused_add_rms_norm_kernel(
     T*       out_row      = x_normed     + row * H;
     T*       res_out_row  = residual_out + row * H;
 
+    int num_warps = (blockDim.x + 31) / 32;
+
     // ── shared memory: warp reduce + val buffer ──
     extern __shared__ float smem[];  // [num_warps + H]
     float* reduce_smem = smem;               // [0 .. num_warps-1]
@@ -97,7 +99,6 @@ __global__ void fused_add_rms_norm_kernel(
     // 用 shared memory 聚合各 warp 的结果
     int warp_id = threadIdx.x / 32;
     int lane_id = threadIdx.x % 32;
-    int num_warps = (blockDim.x + 31) / 32;
 
     if (lane_id == 0) reduce_smem[warp_id] = sum_sq;
     __syncthreads();

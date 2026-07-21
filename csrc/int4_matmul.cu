@@ -83,53 +83,44 @@ __global__ void int4_dequant_matmul_kernel(
         }
         __syncthreads();
 
-        // ---- load x for this K tile ----
-        float x_regs[2] = {0.0f, 0.0f};  // 2 fp16 values per iteration
-        // Stride: each thread loads 8 half values at a time (float4)
-
+        // ---- load x for this K tile (fp16 → float, per element) ----
         // ---- compute dot products ----
-        // For each k in [0, K_THIS) step 4 (process 4 INT4 values = 2 bytes per output)
         for (int kb = 0; kb < k_bytes; kb += 4) {
-            int k0 = kb * 2;  // first K dimension index in this block
-            int k_limit = min(4, k_bytes - kb);
-
-            // Load activation fragment
-            float2 xf2 = *reinterpret_cast<const float2*>(x_ptr + k_start + k0);
-            float x_vals[4];
-            x_vals[0] = xf2.x; x_vals[1] = xf2.y;
-            xf2 = *reinterpret_cast<const float2*>(x_ptr + k_start + k0 + 2);
-            x_vals[2] = xf2.x; x_vals[3] = xf2.y;
+            int k0 = kb * 2;  // K dim index
+            int k_limit = min(4, k_bytes - kb);  // bytes to process
 
             #pragma unroll
-            for (int ki = 0; ki < k_limit && (k0 + ki) * 2 < K_THIS; ki++) {
-                int k_idx = kb + ki;
+            for (int ki = 0; ki < k_limit; ki++) {
+                int k_idx = kb + ki;  // byte index in k_bytes
+                int k_base = (k_idx * 2);  // K dim index
 
-                // Unpack weights for out0 and out1
-                uint8_t w_byte = smem_w[out0][k_idx];
-                int w_low  = (int)(w_byte & 0x0F) - 8;  // signed [-8,7]
-                int w_high = (int)(w_byte >> 4)   - 8;
+                if (k_base + 1 >= K_THIS) break;
 
-                // Group scale lookup
-                int g0 = (k_start + k_idx * 2) / group_size;
-                int g1 = g0;
-                float s0 = __half2float(group_scales[out0 * (K / group_size) + g0]);
-                float s1 = (out1 < N_THIS)
-                         ? __half2float(group_scales[out1 * (K / group_size) + g1]) : 0.0f;
+                // Load 2 activation values (fp16 → float)
+                float xa = __half2float(x_ptr[k_start + k_base]);
+                float xb = __half2float(x_ptr[k_start + k_base + 1]);
 
-                float w0a = (float)w_low  * s0;
-                float w0b = (float)w_high * s0;
-                // Unpack for out1 (if in range)
+                // Unpack 2 INT4 weights for out0 and out1
+                uint8_t w_byte0 = smem_w[out0][k_idx];
+                int w0_low  = (int)(w_byte0 & 0x0F) - 8;
+                int w0_high = (int)(w_byte0 >> 4)   - 8;
+
+                // Group scale
+                int g_idx = (k_start + k_base) / group_size;
+                float s0 = __half2float(group_scales[out0 * (K / group_size) + g_idx]);
+
+                float w0a = (float)w0_low  * s0;
+                float w0b = (float)w0_high * s0;
+
                 float w1a = 0.0f, w1b = 0.0f;
                 if (out1 < N_THIS) {
                     uint8_t w_byte1 = smem_w[out1][k_idx];
                     int w1_low  = (int)(w_byte1 & 0x0F) - 8;
                     int w1_high = (int)(w_byte1 >> 4)   - 8;
+                    float s1 = __half2float(group_scales[out1 * (K / group_size) + g_idx]);
                     w1a = (float)w1_low  * s1;
                     w1b = (float)w1_high * s1;
                 }
-
-                float xa = __half2float(x_vals[ki * 2]);
-                float xb = __half2float(x_vals[ki * 2 + 1]);
 
                 acc[0] += xa * w0a + xb * w0b;
                 if (out1 < N_THIS)
