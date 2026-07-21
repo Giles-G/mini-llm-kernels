@@ -142,7 +142,7 @@ __global__ void decode_paged_attention_kernel(
 
     // ── 寄存器：online softmax 状态 ──
     // o_acc: 累积输出，分布在所有线程（每线程负责 [threadIdx.x, threadIdx.x + stride, ...]）
-    // 用 fixed-size 数组，D <= MAX_BLOCK_DIM * 4（典型 D=64/128）
+    // D 必须 <= MAX_BLOCK_DIM (128)，由 wrapper TORCH_CHECK 保证
     float o_acc[MAX_BLOCK_DIM] = {};  // 初始化为 0
     float m_acc = -FLT_MAX;           // 当前最大值（用于 online softmax 数值稳定）
     float l_acc = 0.0f;               // 归一化因子
@@ -282,7 +282,7 @@ torch::Tensor decode_paged_attention(
     int max_blocks = block_table.size(1);
 
     TORCH_CHECK(H_q % H_kv == 0, "H_q must be divisible by H_kv (GQA)");
-    TORCH_CHECK(D <= MAX_BLOCK_DIM * 4, "head_dim too large (max 512)");
+    TORCH_CHECK(D <= MAX_BLOCK_DIM, "head_dim must be <= MAX_BLOCK_DIM=128 (o_acc stack size)");
     TORCH_CHECK(D % 8 == 0, "head_dim must be divisible by 8 (float4 alignment)");
 
     float scale = 1.0f / sqrtf((float)D);
@@ -515,9 +515,21 @@ torch::Tensor decode_paged_attention_partitioned(
 {
     TORCH_CHECK(q.is_cuda(),           "q must be CUDA tensor");
     TORCH_CHECK(k_cache.is_cuda(),     "k_cache must be CUDA tensor");
+    TORCH_CHECK(v_cache.is_cuda(),     "v_cache must be CUDA tensor");
+    TORCH_CHECK(block_table.is_cuda(), "block_table must be CUDA tensor");
+    TORCH_CHECK(context_lens.is_cuda(),"context_lens must be CUDA tensor");
     TORCH_CHECK(q.dtype() == torch::kFloat16 || q.dtype() == torch::kBFloat16,
                 "only fp16 / bf16 supported");
+    TORCH_CHECK(k_cache.dtype() == q.dtype() && v_cache.dtype() == q.dtype(),
+                "K/V cache dtype must match Q dtype");
+    TORCH_CHECK(block_table.dtype() == torch::kInt32, "block_table must be int32");
+    TORCH_CHECK(context_lens.dtype() == torch::kInt32, "context_lens must be int32");
     TORCH_CHECK(q.dim() == 3, "q must be [N, H_q, D]");
+    TORCH_CHECK(k_cache.dim() == 4, "k_cache must be [num_blocks, block_size, H_kv, D]");
+    TORCH_CHECK(v_cache.dim() == 4, "v_cache must be [num_blocks, block_size, H_kv, D]");
+    TORCH_CHECK(block_table.dim() == 2, "block_table must be [N, max_blocks]");
+    TORCH_CHECK(context_lens.dim() == 1, "context_lens must be [N]");
+    TORCH_CHECK(num_partitions > 0, "num_partitions must be > 0");
 
     int N          = q.size(0);
     int H_q        = q.size(1);
@@ -527,7 +539,7 @@ torch::Tensor decode_paged_attention_partitioned(
     int max_blocks = block_table.size(1);
 
     TORCH_CHECK(H_q % H_kv == 0, "H_q must be divisible by H_kv (GQA)");
-    TORCH_CHECK(D <= MAX_BLOCK_DIM * 4, "head_dim too large");
+    TORCH_CHECK(D <= MAX_BLOCK_DIM, "head_dim must be <= MAX_BLOCK_DIM=128 (o_acc stack size)");
     TORCH_CHECK(D % 8 == 0, "head_dim must be divisible by 8 (float4 alignment)");
 
     float scale = 1.0f / sqrtf((float)D);
