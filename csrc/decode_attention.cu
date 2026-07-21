@@ -295,7 +295,7 @@ torch::Tensor decode_paged_attention(
 
     // shared memory: K_tile + V_tile + cross-warp reduction buffer
     int num_warps = threads / 32;
-    size_t smem_bytes = 2 * block_size * D * (q.dtype() == torch::kFloat16 ? 2 : 2)
+    size_t smem_bytes = 2 * block_size * D * sizeof(__half)
                       + num_warps * sizeof(float);
 
     // 检查 shared memory 是否超限，必要时申请扩展 shared memory
@@ -372,7 +372,7 @@ __global__ void decode_paged_attention_partial_kernel(
     int ctx_len = context_lens[batch_idx];
     if (ctx_len == 0) {
         int global_head_idx = partition_id * N * H_q + batch_idx * H_q + q_head_idx;
-        m_partial[global_head_idx] = 0.0f;
+        m_partial[global_head_idx] = -FLT_MAX;
         l_partial[global_head_idx] = 0.0f;
         for (int i = threadIdx.x; i < D; i += blockDim.x)
             o_partial[global_head_idx * D + i] = 0.0f;
@@ -498,7 +498,7 @@ __global__ void decode_attention_merge_kernel(
             int idx = p * N * H_q + batch_idx * H_q + q_head_idx;
             sum += expf(m_partial[idx] - m_global) * o_partial[idx * D + i];
         }
-        out_base[i] = sum / l_global;
+        out_base[i] = (l_global > 0.0f) ? (sum / l_global) : 0.0f;
     }
 }
 

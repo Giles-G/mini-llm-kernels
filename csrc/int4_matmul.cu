@@ -56,7 +56,6 @@ __global__ void int4_dequant_matmul_kernel(
     const T*        __restrict__ group_scales, // [N, K/group_size] fp16
     T*              __restrict__ y,            // [B, N] fp16
     int B, int N, int K, int group_size,
-    int use_awq,                               // 1 = apply AWQ pre-scale (via x)
     int K_TILE)                                // compile-time tile: 64
 {
     int batch_idx = blockIdx.x;
@@ -107,6 +106,9 @@ __global__ void int4_dequant_matmul_kernel(
 
                 if (k_base + 1 >= K_THIS) break;
 
+                // Skip computation for out-of-range outputs (avoids reading uninitialized smem)
+                if (out0 >= N_THIS) continue;
+
                 // Load 2 activation values (fp16/bf16 → float)
                 float xa = _to_float(x_ptr[k_start + k_base]);
                 float xb = _to_float(x_ptr[k_start + k_base + 1]);
@@ -116,9 +118,9 @@ __global__ void int4_dequant_matmul_kernel(
                 int w0_low  = (int)(w_byte0 & 0x0F) - 8;
                 int w0_high = (int)(w_byte0 >> 4)   - 8;
 
-                // Group scale
+                // Group scale (use GLOBAL output index N_START + out0)
                 int g_idx = (k_start + k_base) / group_size;
-                float s0 = _to_float(group_scales[out0 * (K / group_size) + g_idx]);
+                float s0 = _to_float(group_scales[(N_START + out0) * (K / group_size) + g_idx]);
 
                 float w0a = (float)w0_low  * s0;
                 float w0b = (float)w0_high * s0;
@@ -128,7 +130,7 @@ __global__ void int4_dequant_matmul_kernel(
                     uint8_t w_byte1 = smem_w[out1][k_idx];
                     int w1_low  = (int)(w_byte1 & 0x0F) - 8;
                     int w1_high = (int)(w_byte1 >> 4)   - 8;
-                    float s1 = _to_float(group_scales[out1 * (K / group_size) + g_idx]);
+                    float s1 = _to_float(group_scales[(N_START + out1) * (K / group_size) + g_idx]);
                     w1a = (float)w1_low  * s1;
                     w1b = (float)w1_high * s1;
                 }
@@ -197,7 +199,7 @@ torch::Tensor int4_dequant_matmul(
             reinterpret_cast<const __half*>(group_scales.data_ptr()),
             reinterpret_cast<__half*>(y.data_ptr()),
             (int)batch_elems, N, K, group_size,
-            0, K_TILE
+            K_TILE
         );
     } else {
         int4_dequant_matmul_kernel<__nv_bfloat16><<<grid, 128>>>(
@@ -206,7 +208,7 @@ torch::Tensor int4_dequant_matmul(
             reinterpret_cast<const __nv_bfloat16*>(group_scales.data_ptr()),
             reinterpret_cast<__nv_bfloat16*>(y.data_ptr()),
             (int)batch_elems, N, K, group_size,
-            0, K_TILE
+            K_TILE
         );
     }
 
