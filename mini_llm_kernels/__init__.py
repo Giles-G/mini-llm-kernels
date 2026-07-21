@@ -8,6 +8,8 @@ M4：decode_paged_attention（带 PyTorch fallback）
 
 from __future__ import annotations
 
+import torch  # noqa: F401 — must import before _C (libc10.so dependency)
+
 try:
     from ._C import add_tensors  # noqa: F401
     _HAS_CUDA_OPS = True
