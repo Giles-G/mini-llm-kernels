@@ -31,6 +31,7 @@ if cuda_available():
         cuda_ext = CUDAExtension(
             name="mini_llm_kernels._C",
             sources=[
+                "csrc/bindings.cpp",
                 "csrc/add_tensors.cu",
                 "csrc/fused_norm.cu",
                 "csrc/decode_attention.cu",
