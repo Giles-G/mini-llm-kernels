@@ -17,6 +17,9 @@ torch::Tensor decode_paged_attention(
 torch::Tensor decode_paged_attention_partitioned(
     torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache,
     torch::Tensor block_table, torch::Tensor context_lens, int num_partitions);
+torch::Tensor paged_prefill_attention(
+    torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache,
+    torch::Tensor block_table, torch::Tensor chunk_lens, torch::Tensor history_lens);
 torch::Tensor int4_dequant_matmul(
     torch::Tensor x, torch::Tensor w_packed, torch::Tensor group_scales,
     int group_size);
@@ -30,6 +33,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Block-aware paged decode attention");
     m.def("decode_paged_attention_partitioned", &decode_paged_attention_partitioned,
           "KV-sequence-partitioned decode attention");
+    m.def("paged_prefill_attention", &paged_prefill_attention,
+          "Block-aware paged prefill attention");
     m.def("int4_dequant_matmul", &int4_dequant_matmul,
           "Fused INT4 dequantize + matmul");
 }
