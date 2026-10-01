@@ -131,7 +131,7 @@ __global__ void decode_paged_attention_kernel(
     T* K_tile = reinterpret_cast<T*>(smem);
     T* V_tile = K_tile + block_size * D;
 
-// ── warp / lane / block 常量 ──
+    // ── warp / lane / block 常量 ──
     int warp_id   = threadIdx.x / 32;
     int lane_id   = threadIdx.x % 32;
     int num_warps = blockDim.x / 32;
