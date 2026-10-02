@@ -6,6 +6,7 @@
  */
 
 #include <torch/extension.h>
+#include <torch/csrc/utils/pybind.h>
 
 // ── Declarations (defined in .cu files) ──
 torch::Tensor add_tensors(torch::Tensor a, torch::Tensor b);
@@ -23,6 +24,10 @@ torch::Tensor paged_prefill_attention(
 torch::Tensor int4_dequant_matmul(
     torch::Tensor x, torch::Tensor w_packed, torch::Tensor group_scales,
     int group_size);
+torch::Tensor gemma4_decode_attention(
+    torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache,
+    torch::Tensor block_table, torch::Tensor context_lens,
+    int64_t window_size);
 
 // ── Module registration ──
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -37,4 +42,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Block-aware paged prefill attention");
     m.def("int4_dequant_matmul", &int4_dequant_matmul,
           "Fused INT4 dequantize + matmul");
+    m.def("gemma4_decode_attention", &gemma4_decode_attention,
+          "Gemma4 paged decode attention (head_dim 256/512, sliding window)");
 }

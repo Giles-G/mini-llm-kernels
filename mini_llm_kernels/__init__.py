@@ -20,6 +20,11 @@ except ImportError:
 
 from mini_llm_kernels.kernels.fused_norm import fused_add_rms_norm        # noqa: F401
 from mini_llm_kernels.kernels.decode_attention import decode_paged_attention  # noqa: F401
+from mini_llm_kernels.kernels.gemma4_attention import (  # noqa: F401
+    cuda_attention_status,
+    cuda_attention_usable,
+    gemma4_decode_attention,
+)
 from mini_llm_kernels.kernels.prefill_attention import paged_prefill_attention  # noqa: F401
 
 __all__ = ["_HAS_CUDA_OPS", "fused_add_rms_norm", "decode_paged_attention", "paged_prefill_attention"]

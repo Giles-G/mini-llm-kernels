@@ -37,6 +37,7 @@ if cuda_available():
                 "csrc/decode_attention.cu",
                 "csrc/prefill_attention.cu",
                 "csrc/int4_matmul.cu",
+                "csrc/gemma4_attention.cu",
             ],
             include_dirs=["csrc"],
             extra_compile_args={
