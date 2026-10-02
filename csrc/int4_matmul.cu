@@ -10,17 +10,29 @@
  * Target: batch=1..4 decode M≤4, where Tensor Cores are under-utilised.
  * Uses SIMT warp-level dot product with FMAD instructions.
  *
+ * ── Packed layout (must match ``gemma4_quant._pack_int4``) ──
+ *   w_packed is [N/2, K] uint8, row-major, so ONE PACKED ROW IS K BYTES
+ *   (= 2*K nibbles) and covers TWO output rows:
+ *
+ *       byte (n >> 1, k >> 1) = (w[n|1][k] << 4) | (w[n&~1][k] & 0xF)
+ *
+ *   i.e. even output row n → LOW nibble, odd output row n → HIGH nibble,
+ *   values unsigned [0,15] biased by 8 from signed [-8,7].
+ *
+ *   The row-address stride is therefore ``K`` bytes and a thread must load
+ *   exactly ONE nibble (selected by the output row's parity). Summing both
+ *   nibbles of a byte mixes in the neighbouring output row's weights, and
+ *   using a K/2 stride walks off the end of the row entirely.
+ *
  * Thread layout:
- *   grid:  [B, (N + 127) / 128]
- *   block: 128 threads (4 warps)
+ *   grid:  [B, (N + N_TILE - 1) / N_TILE],  block: 256 threads (8 warps)
  *
- * Each block processes 128 output dimensions at a time.
- * Each thread owns 2 output dimensions (tid, tid+64).
- * The K dimension is blocked into K_TILE=64 tiles.
- *
- * INT4 packed format:
- *   2 consecutive output rows share 1 byte: byte = (w[2n+1]<<4) | (w[2n]&0xF)
- *   where each w-value is unsigned [0,15] offset from signed [-8,7].
+ *   The block cooperatively loads the [2,16] nibble lookup table and the
+ *   K_TILE x-values into shared memory, then every thread walks the K tiles
+ *   for its own output rows. Weights are read as one unpacked byte per
+ *   output row and broadcast through shared memory, so the x tile is read
+ *   from shared memory and the weight traffic is the theoretical 4-bit
+ *   minimum (no dense fp16 weight is ever materialised).
  */
 
 #include <cuda_runtime.h>
@@ -39,106 +51,92 @@ __device__ __forceinline__ T _from_float(float v);
 template<> __device__ __forceinline__ __half        _from_float<__half>(float v)        { return __float2half(v); }
 template<> __device__ __forceinline__ __nv_bfloat16 _from_float<__nv_bfloat16>(float v) { return __float2bfloat16(v); }
 
-// warp reduce helpers (inline in this file to avoid extra dependency)
-__device__ __forceinline__ float _warp_reduce_sum(float v) {
-    for (int offset = 16; offset > 0; offset >>= 1)
-        v += __shfl_xor_sync(0xffffffff, v, offset);
-    return v;
-}
+namespace {
+
+constexpr int kNThreads = 256;   // 8 warps
+constexpr int kNTile    = 256;   // output rows per block
+constexpr int kKTile    = 64;    // K elements per tile (== one scale group)
+constexpr int kNTileLo  = kNTile / 2;
+
+}  // namespace
 
 // ───────────────────────────────────────────────────────────────────
 // Main kernel
 // ───────────────────────────────────────────────────────────────────
 template<typename T>
 __global__ void int4_dequant_matmul_kernel(
-    const T*        __restrict__ x,            // [B, K] fp16
-    const uint8_t*  __restrict__ w_packed,     // [N//2, K] uint8 (2 INT4/byte)
-    const T*        __restrict__ group_scales, // [N, K/group_size] fp16
-    T*              __restrict__ y,            // [B, N] fp16
-    int B, int N, int K, int group_size,
-    int K_TILE)                                // compile-time tile: 64
+    const T*        __restrict__ x,            // [B, K]
+    const uint8_t*  __restrict__ w_packed,     // [N/2, K] uint8 (2 INT4/byte)
+    const T*        __restrict__ group_scales, // [N, K/group_size]
+    T*              __restrict__ y,            // [B, N]
+    int B, int N, int K, int group_size)
 {
-    int batch_idx = blockIdx.x;
-    int n_block   = blockIdx.y;       // which 128-out slice
-    int tid       = threadIdx.x;      // 0..127
+    const int batch_idx = blockIdx.x;
+    const int n_start   = blockIdx.y * kNTile;
+    const int tid       = threadIdx.x;
 
-    int N_START = n_block * 128;
-    int N_THIS  = (N_START + 128 <= N) ? 128 : (N - N_START);
-    if (N_THIS <= 0) return;
+    const int n_this = min(kNTile, N - n_start);
+    if (n_this <= 0) return;
 
-    // ── pointers ──
-    const T* x_ptr = x + batch_idx * (long long)K;
-    T* y_ptr       = y + batch_idx * (long long)N + N_START;
+    const int n_groups = K / group_size;
 
-    // ── shared memory: weight tile ──
-    // [128 out, K_TILE/2 packed bytes] = 128 × 32 = 4 KB
-    __shared__ uint8_t smem_w[128][32];  // 32 = K_TILE/2 = 64/2
+    const T* __restrict__ x_row = x + (long long)batch_idx * K;
+    T* __restrict__ y_row       = y + (long long)batch_idx * N + n_start;
 
-    // ── registers: accumulator ──
-    float acc[2] = {0.0f, 0.0f};
-    // Each thread owns one output dimension. The packed row stores two
-    // output dimensions, but that packing is only a storage format.
-    int out0 = tid;          // 0..127
+    __shared__ float smem_nib[16];
+    __shared__ T     smem_x[kKTile];
 
-    // ── iterate over K ──
-    for (int k_start = 0; k_start < K; k_start += K_TILE) {
-        int K_THIS = (k_start + K_TILE <= K) ? K_TILE : (K - k_start);
+    // Nibble code -> signed value.
+    if (tid < 16) {
+        smem_nib[tid] = (float)(tid - 8);
+    }
 
-        // ---- cooperative load weight tile ----
-        // Each thread loads 8 uint8 values (float2) → 16 bytes
-        int k_bytes = (K_THIS + 1) / 2;  // K_THIS INT4 values → K_THIS/2 bytes
-        for (int i = tid; i < N_THIS * k_bytes; i += blockDim.x) {
-            int out_off = i / k_bytes;
-            int k_off   = i % k_bytes;
-            // Each thread handles one output row; packed rows contain two output rows.
-            int packed_row = (N_START + out_off) / 2;
-            smem_w[out_off][k_off] = w_packed[packed_row * K + (k_start / 2) + k_off];
+    float acc[2] = {0.0f, 0.0f};   // rows n_start+tid and n_start+tid+kNTileLo
+
+    for (int k_start = 0; k_start < K; k_start += kKTile) {
+        const int k_this = min(kKTile, K - k_start);
+        const int k_bytes = k_this;                // one packed byte per column
+        const int g = k_start / group_size;
+
+        if (tid < k_this) {
+            smem_x[tid] = x_row[k_start + tid];
         }
         __syncthreads();
 
-        // ---- load x for this K tile (fp16 → float, per element) ----
-        // ---- compute dot products ----
-        for (int kb = 0; kb < k_bytes; kb += 4) {
-            int k_limit = min(4, k_bytes - kb);  // bytes to process
+        #pragma unroll
+        for (int r = 0; r < 2; r++) {
+            const int n_local = tid + r * kNTileLo;      // 0 .. kNTile-1
+            if (n_local >= n_this) continue;
+            const int n_global = n_start + n_local;
 
-            #pragma unroll
-            for (int ki = 0; ki < k_limit; ki++) {
-                int k_idx = kb + ki;  // byte index in k_bytes
-                int k_base = (k_idx * 2);  // K dim index
+            // Packed row of the pair (2m, 2m+1) that owns this output row.
+            // The packed row is K bytes wide: byte at column k of the pair row
+            // holds row 2m at column k in the LOW nibble and row 2m+1 at
+            // column k in the HIGH nibble. So the row stride is K and a single
+            // thread reads exactly one nibble per byte — never both, which
+            // would mix in the neighbour row's weights.
+            const uint8_t* __restrict__ w_pair =
+                w_packed + (long long)(n_global >> 1) * K;
+            const bool high_row = (n_global & 1) != 0;
+            float dot = 0.0f;
 
-                if (k_base + 1 >= K_THIS) break;
-
-                // Skip computation for out-of-range outputs (avoids reading uninitialized smem)
-                if (out0 >= N_THIS) continue;
-
-                // Load 2 activation values (fp16/bf16 → float)
-                float xa = _to_float(x_ptr[k_start + k_base]);
-                float xb = _to_float(x_ptr[k_start + k_base + 1]);
-
-                // Unpack the selected output row's two consecutive K values.
-                uint8_t w_byte0 = smem_w[out0][k_idx];
-                int w0_low  = (int)(w_byte0 & 0x0F) - 8;
-                int w0_high = (int)(w_byte0 >> 4)   - 8;
-
-                // Group scale (use GLOBAL output index N_START + out0)
-                int g_idx = (k_start + k_base) / group_size;
-                float s0 = _to_float(group_scales[(N_START + out0) * (K / group_size) + g_idx]);
-
-                float w0a = (float)w0_low  * s0;
-                float w0b = (float)w0_high * s0;
-
-                acc[0] += xa * w0a + xb * w0b;
+            // One byte per column; this thread contributes one nibble of it.
+            // The K tile offset must be added explicitly: the packed row spans
+            // all K columns, so tile t starts at byte k_start.
+            #pragma unroll 4
+            for (int kb = 0; kb < k_bytes; kb++) {
+                const uint8_t byte = w_pair[k_start + kb];
+                const int code = high_row ? (int)(byte >> 4) : (int)(byte & 0x0F);
+                dot += _to_float(smem_x[kb]) * smem_nib[code];
             }
+
+            acc[r] += dot * _to_float(group_scales[(long long)n_global * n_groups + g]);
         }
         __syncthreads();
     }
 
-    // ── warp reduce (dot partial sums from different threads) ──
-    // Each thread owns one output row, so no cross-thread reduction is needed.
-
-    // ── write output ──
-    if (out0 < N_THIS)
-        y_ptr[out0] = _from_float<T>(acc[0]);
+    if (tid < n_this)              y_row[tid]              = _from_float<T>(acc[0]);
+    if (tid + kNTileLo < n_this)   y_row[tid + kNTileLo]   = _from_float<T>(acc[1]);
 }
 
 // ───────────────────────────────────────────────────────────────────
@@ -167,35 +165,34 @@ torch::Tensor int4_dequant_matmul(
 
     TORCH_CHECK(x.numel() == batch_elems * K, "x shape mismatch");
     TORCH_CHECK(w_packed.size(1) == K, "w_packed K dim must match x last dim");
-    // The packed storage is [N/2, K], while group scales stay [N, K/groups].
-    TORCH_CHECK(w_packed.size(0) * 2 == N, "packed weight row count mismatch");
+    TORCH_CHECK(K % 2 == 0, "K must be even for INT4 packing");
+    TORCH_CHECK(K % group_size == 0, "K must be divisible by group_size");
     TORCH_CHECK(group_scales.size(0) == N, "group_scales N must match unpacked N");
-    TORCH_CHECK(group_scales.size(1) == (K + group_size - 1) / group_size,
-                "group_scales K dim mismatch");
+    TORCH_CHECK(group_scales.size(1) == K / group_size, "group_scales K dim mismatch");
+    // The kernel loads a full K_TILE of activations into shared memory.
+    TORCH_CHECK(K % kKTile == 0 || K >= kKTile,
+                "K must be at least one K_TILE for the shared-memory staging path");
 
     auto x_2d = x.reshape({batch_elems, K});
     auto y = torch::empty({batch_elems, N}, x.options());
 
-    dim3 grid((unsigned)batch_elems, (unsigned)((N + 127) / 128));
-    int K_TILE = 64;
+    dim3 grid((unsigned)batch_elems, (unsigned)((N + kNTile - 1) / kNTile));
 
     if (x.dtype() == torch::kFloat16) {
-        int4_dequant_matmul_kernel<__half><<<grid, 128>>>(
+        int4_dequant_matmul_kernel<__half><<<grid, kNThreads>>>(
             reinterpret_cast<const __half*>(x_2d.data_ptr()),
             w_packed.data_ptr<uint8_t>(),
             reinterpret_cast<const __half*>(group_scales.data_ptr()),
             reinterpret_cast<__half*>(y.data_ptr()),
-            (int)batch_elems, N, K, group_size,
-            K_TILE
+            (int)batch_elems, N, K, group_size
         );
     } else {
-        int4_dequant_matmul_kernel<__nv_bfloat16><<<grid, 128>>>(
+        int4_dequant_matmul_kernel<__nv_bfloat16><<<grid, kNThreads>>>(
             reinterpret_cast<const __nv_bfloat16*>(x_2d.data_ptr()),
             w_packed.data_ptr<uint8_t>(),
             reinterpret_cast<const __nv_bfloat16*>(group_scales.data_ptr()),
             reinterpret_cast<__nv_bfloat16*>(y.data_ptr()),
-            (int)batch_elems, N, K, group_size,
-            K_TILE
+            (int)batch_elems, N, K, group_size
         );
     }
 
