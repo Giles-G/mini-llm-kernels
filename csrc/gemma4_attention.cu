@@ -331,6 +331,13 @@ __global__ void gemma4_attention_safe_kernel(
 
     float output[MAX_VALUES] = {0.0f};
     __shared__ float warp_sums[WARPS];
+    __shared__ float max_score;
+    __shared__ float sum_score;
+    if (tid == 0) {
+        max_score = -FLT_MAX;
+        sum_score = 0.0f;
+    }
+    __syncthreads();
 
     for (int logical = start; logical < context_len; ++logical) {
         const int physical_block =
@@ -346,9 +353,9 @@ __global__ void gemma4_attention_safe_kernel(
         for (int j = 0; j < MAX_VALUES; ++j) {
             const int dim = tid + j * BLOCK_DIM;
             if (dim < d)
-                dot += gemma4_to_float(q_row[dim]) * gemma4_to_float(k_row[dim]);
+                dot += g4_to_float(q_row[dim]) * g4_to_float(k_row[dim]);
         }
-        dot = gemma4_warp_sum(dot);
+        dot = g4_warp_sum(dot);
         if (lane == 0)
             warp_sums[warp] = dot;
         __syncthreads();
@@ -365,8 +372,6 @@ __global__ void gemma4_attention_safe_kernel(
         // Online softmax needs a scalar max/sum shared by every lane. Since
         // this kernel processes one token at a time, retain the stable
         // recurrence in two shared scalars.
-        __shared__ float max_score;
-        __shared__ float sum_score;
         if (tid == 0) {
             const float old_max = max_score;
             const float new_max = fmaxf(old_max, score);
@@ -385,7 +390,7 @@ __global__ void gemma4_attention_safe_kernel(
             const int dim = tid + j * BLOCK_DIM;
             if (dim < d) {
                 output[j] = old_factor * output[j]
-                    + current * gemma4_to_float(v_row[dim]);
+                    + current * g4_to_float(v_row[dim]);
             }
         }
         __syncthreads();
@@ -395,7 +400,7 @@ __global__ void gemma4_attention_safe_kernel(
     for (int j = 0; j < MAX_VALUES; ++j) {
         const int dim = tid + j * BLOCK_DIM;
         if (dim < d)
-            out_row[dim] = gemma4_from_float<T>(output[j] * inv_sum);
+            out_row[dim] = g4_from_float<T>(output[j] * inv_sum);
     }
 }
 
