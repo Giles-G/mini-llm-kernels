@@ -27,6 +27,14 @@ from mini_llm_kernels.kernels.gemma4_attention import (  # noqa: F401
 )
 from mini_llm_kernels.kernels.prefill_attention import paged_prefill_attention  # noqa: F401
 
-__all__ = ["_HAS_CUDA_OPS", "fused_add_rms_norm", "decode_paged_attention", "paged_prefill_attention"]
+__all__ = [
+    "_HAS_CUDA_OPS",
+    "fused_add_rms_norm",
+    "decode_paged_attention",
+    "paged_prefill_attention",
+    "gemma4_decode_attention",
+    "cuda_attention_usable",
+    "cuda_attention_status",
+]
 if _HAS_CUDA_OPS:
     __all__ += ["add_tensors"]

@@ -39,6 +39,9 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAGuard.h>
 
 // type conversion helpers (templated for fp16 / bf16)
 template<typename T>
@@ -53,10 +56,9 @@ template<> __device__ __forceinline__ __nv_bfloat16 _from_float<__nv_bfloat16>(f
 
 namespace {
 
-constexpr int kNThreads = 256;   // 8 warps
-constexpr int kNTile    = 256;   // output rows per block
+constexpr int kNThreads = 128;   // 4 warps
+constexpr int kNTile    = 128;   // output rows per block
 constexpr int kKTile    = 64;    // K elements per tile (== one scale group)
-constexpr int kNTileLo  = kNTile / 2;
 
 }  // namespace
 
@@ -67,7 +69,7 @@ template<typename T>
 __global__ void int4_dequant_matmul_kernel(
     const T*        __restrict__ x,            // [B, K]
     const uint8_t*  __restrict__ w_packed,     // [N/2, K] uint8 (2 INT4/byte)
-    const T*        __restrict__ group_scales, // [N, K/group_size]
+    const __half*   __restrict__ group_scales, // [N, K/group_size], fp16
     T*              __restrict__ y,            // [B, N]
     int B, int N, int K, int group_size)
 {
@@ -90,8 +92,9 @@ __global__ void int4_dequant_matmul_kernel(
     if (tid < 16) {
         smem_nib[tid] = (float)(tid - 8);
     }
+    __syncthreads();
 
-    float acc[2] = {0.0f, 0.0f};   // rows n_start+tid and n_start+tid+kNTileLo
+    float acc = 0.0f;
 
     for (int k_start = 0; k_start < K; k_start += kKTile) {
         const int k_this = min(kKTile, K - k_start);
@@ -103,40 +106,26 @@ __global__ void int4_dequant_matmul_kernel(
         }
         __syncthreads();
 
-        #pragma unroll
-        for (int r = 0; r < 2; r++) {
-            const int n_local = tid + r * kNTileLo;      // 0 .. kNTile-1
-            if (n_local >= n_this) continue;
+        const int n_local = tid;
+        if (n_local < n_this) {
             const int n_global = n_start + n_local;
-
-            // Packed row of the pair (2m, 2m+1) that owns this output row.
-            // The packed row is K bytes wide: byte at column k of the pair row
-            // holds row 2m at column k in the LOW nibble and row 2m+1 at
-            // column k in the HIGH nibble. So the row stride is K and a single
-            // thread reads exactly one nibble per byte — never both, which
-            // would mix in the neighbour row's weights.
             const uint8_t* __restrict__ w_pair =
                 w_packed + (long long)(n_global >> 1) * K;
             const bool high_row = (n_global & 1) != 0;
             float dot = 0.0f;
-
-            // One byte per column; this thread contributes one nibble of it.
-            // The K tile offset must be added explicitly: the packed row spans
-            // all K columns, so tile t starts at byte k_start.
             #pragma unroll 4
             for (int kb = 0; kb < k_bytes; kb++) {
                 const uint8_t byte = w_pair[k_start + kb];
                 const int code = high_row ? (int)(byte >> 4) : (int)(byte & 0x0F);
                 dot += _to_float(smem_x[kb]) * smem_nib[code];
             }
-
-            acc[r] += dot * _to_float(group_scales[(long long)n_global * n_groups + g]);
+            acc += dot * _to_float(group_scales[(long long)n_global * n_groups + g]);
         }
         __syncthreads();
     }
 
-    if (tid < n_this)              y_row[tid]              = _from_float<T>(acc[0]);
-    if (tid + kNTileLo < n_this)   y_row[tid + kNTileLo]   = _from_float<T>(acc[1]);
+    if (tid < n_this)
+        y_row[tid] = _from_float<T>(acc);
 }
 
 // ───────────────────────────────────────────────────────────────────
@@ -153,7 +142,10 @@ torch::Tensor int4_dequant_matmul(
     TORCH_CHECK(x.dtype() == torch::kFloat16 || x.dtype() == torch::kBFloat16,
                 "x must be fp16/bf16");
     TORCH_CHECK(w_packed.dtype() == torch::kUInt8, "w_packed must be uint8");
-    TORCH_CHECK(group_scales.dtype() == x.dtype(), "scales dtype must match x");
+    TORCH_CHECK(group_scales.dtype() == torch::kFloat16,
+                "Gemma4 INT4 group scales must be float16");
+    TORCH_CHECK(group_size == kKTile,
+                "Gemma4 INT4 CUDA kernel currently requires group_size=64");
 
     // Handle arbitrary batch dimensions by flattening
     auto orig_shape = x.sizes();
@@ -169,6 +161,13 @@ torch::Tensor int4_dequant_matmul(
     TORCH_CHECK(K % group_size == 0, "K must be divisible by group_size");
     TORCH_CHECK(group_scales.size(0) == N, "group_scales N must match unpacked N");
     TORCH_CHECK(group_scales.size(1) == K / group_size, "group_scales K dim mismatch");
+    TORCH_CHECK(x.is_contiguous() && w_packed.is_contiguous() &&
+                    group_scales.is_contiguous(),
+                "INT4 CUDA inputs must be contiguous");
+    const c10::cuda::CUDAGuard device_guard(x.device());
+    TORCH_CHECK(w_packed.device() == x.device() &&
+                    group_scales.device() == x.device(),
+                "INT4 CUDA inputs must be on the same device");
     // The kernel loads a full K_TILE of activations into shared memory.
     TORCH_CHECK(K % kKTile == 0 || K >= kKTile,
                 "K must be at least one K_TILE for the shared-memory staging path");
@@ -179,7 +178,8 @@ torch::Tensor int4_dequant_matmul(
     dim3 grid((unsigned)batch_elems, (unsigned)((N + kNTile - 1) / kNTile));
 
     if (x.dtype() == torch::kFloat16) {
-        int4_dequant_matmul_kernel<__half><<<grid, kNThreads>>>(
+        int4_dequant_matmul_kernel<__half><<<
+            grid, kNThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
             reinterpret_cast<const __half*>(x_2d.data_ptr()),
             w_packed.data_ptr<uint8_t>(),
             reinterpret_cast<const __half*>(group_scales.data_ptr()),
@@ -187,14 +187,16 @@ torch::Tensor int4_dequant_matmul(
             (int)batch_elems, N, K, group_size
         );
     } else {
-        int4_dequant_matmul_kernel<__nv_bfloat16><<<grid, kNThreads>>>(
+        int4_dequant_matmul_kernel<__nv_bfloat16><<<
+            grid, kNThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
             reinterpret_cast<const __nv_bfloat16*>(x_2d.data_ptr()),
             w_packed.data_ptr<uint8_t>(),
-            reinterpret_cast<const __nv_bfloat16*>(group_scales.data_ptr()),
+            reinterpret_cast<const __half*>(group_scales.data_ptr()),
             reinterpret_cast<__nv_bfloat16*>(y.data_ptr()),
             (int)batch_elems, N, K, group_size
         );
     }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     // Restore original batch shape
     if (orig_shape.size() > 2) {

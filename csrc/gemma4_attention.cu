@@ -68,6 +68,9 @@
 #include <float.h>
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <algorithm>
 #include <limits>
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -290,6 +293,112 @@ __global__ void gemma4_attention_merge_kernel(
     }
 }
 
+// Safe baseline kernel for Gemma4. One block owns one (request, query-head)
+// pair and scans only the visible KV range. Every lane executes the same
+// shuffle calls; inactive tokens are represented by a uniform loop bound
+// instead of divergent warp participation. This is intentionally simple and
+// serves as the correctness baseline before any split-K optimization.
+template<typename T, int BLOCK_DIM>
+__global__ void gemma4_attention_safe_kernel(
+    const T* __restrict__ q,
+    const T* __restrict__ k_cache,
+    const T* __restrict__ v_cache,
+    const int* __restrict__ block_table,
+    const int* __restrict__ context_lens,
+    T* __restrict__ out,
+    int h_q,
+    int h_kv,
+    int d,
+    int block_size,
+    int max_blocks,
+    int window_size)
+{
+    const int request = blockIdx.x;
+    const int q_head = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    constexpr int WARPS = BLOCK_DIM / 32;
+    constexpr int MAX_VALUES = (512 + BLOCK_DIM - 1) / BLOCK_DIM;
+
+    const int context_len = context_lens[request];
+    const int start = window_size > 0
+        ? max(0, context_len - window_size)
+        : 0;
+    const int kv_head = q_head / (h_q / h_kv);
+    const T* q_row = q + ((long long)request * h_q + q_head) * d;
+    T* out_row = out + ((long long)request * h_q + q_head) * d;
+
+    float output[MAX_VALUES] = {0.0f};
+    __shared__ float warp_sums[WARPS];
+
+    for (int logical = start; logical < context_len; ++logical) {
+        const int physical_block =
+            block_table[(long long)request * max_blocks + logical / block_size];
+        const int slot = logical % block_size;
+        const T* k_row = k_cache +
+            (((long long)physical_block * block_size + slot) * h_kv + kv_head) * d;
+        const T* v_row = v_cache +
+            (((long long)physical_block * block_size + slot) * h_kv + kv_head) * d;
+
+        float dot = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < MAX_VALUES; ++j) {
+            const int dim = tid + j * BLOCK_DIM;
+            if (dim < d)
+                dot += gemma4_to_float(q_row[dim]) * gemma4_to_float(k_row[dim]);
+        }
+        dot = gemma4_warp_sum(dot);
+        if (lane == 0)
+            warp_sums[warp] = dot;
+        __syncthreads();
+        if (tid == 0) {
+            float total = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < WARPS; ++w)
+                total += warp_sums[w];
+            warp_sums[0] = total;
+        }
+        __syncthreads();
+        const float score = warp_sums[0];  // Gemma4 reference scale is 1.0.
+
+        // Online softmax needs a scalar max/sum shared by every lane. Since
+        // this kernel processes one token at a time, retain the stable
+        // recurrence in two shared scalars.
+        __shared__ float max_score;
+        __shared__ float sum_score;
+        if (tid == 0) {
+            const float old_max = max_score;
+            const float new_max = fmaxf(old_max, score);
+            const float old_factor = old_max == -FLT_MAX
+                ? 0.0f : expf(old_max - new_max);
+            const float current = expf(score - new_max);
+            max_score = new_max;
+            sum_score = old_factor * sum_score + current;
+            warp_sums[0] = old_factor;
+            warp_sums[1] = current;
+        }
+        __syncthreads();
+        const float old_factor = warp_sums[0];
+        const float current = warp_sums[1];
+        for (int j = 0; j < MAX_VALUES; ++j) {
+            const int dim = tid + j * BLOCK_DIM;
+            if (dim < d) {
+                output[j] = old_factor * output[j]
+                    + current * gemma4_to_float(v_row[dim]);
+            }
+        }
+        __syncthreads();
+    }
+
+    const float inv_sum = sum_score > 0.0f ? 1.0f / sum_score : 0.0f;
+    for (int j = 0; j < MAX_VALUES; ++j) {
+        const int dim = tid + j * BLOCK_DIM;
+        if (dim < d)
+            out_row[dim] = gemma4_from_float<T>(output[j] * inv_sum);
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Python 绑定
 // ─────────────────────────────────────────────────────────────────────────────
@@ -303,6 +412,8 @@ torch::Tensor gemma4_decode_attention(
 {
     TORCH_CHECK(q.is_cuda() && k_cache.is_cuda() && v_cache.is_cuda(),
                 "gemma4_decode_attention: q/k_cache/v_cache must be CUDA tensors");
+    TORCH_CHECK(block_table.is_cuda() && context_lens.is_cuda(),
+                "gemma4_decode_attention: metadata must be CUDA tensors");
     TORCH_CHECK(q.dtype() == torch::kFloat16 || q.dtype() == torch::kBFloat16,
                 "gemma4_decode_attention: q must be fp16/bf16");
     TORCH_CHECK(k_cache.dtype() == q.dtype() && v_cache.dtype() == q.dtype(),
@@ -310,6 +421,11 @@ torch::Tensor gemma4_decode_attention(
     TORCH_CHECK(q.dim() == 3 && k_cache.dim() == 4 && v_cache.dim() == 4,
                 "gemma4_decode_attention: expected q [N,H_q,D] and caches [blocks,bs,H_kv,D]");
 
+    const c10::cuda::CUDAGuard device_guard(q.device());
+    TORCH_CHECK(k_cache.device() == q.device() && v_cache.device() == q.device() &&
+                    block_table.device() == q.device() &&
+                    context_lens.device() == q.device(),
+                "gemma4_decode_attention: all tensors must be on the same device");
     auto q_c = q.contiguous();
     auto k_c = k_cache.contiguous();
     auto v_c = v_cache.contiguous();
@@ -326,6 +442,8 @@ torch::Tensor gemma4_decode_attention(
     TORCH_CHECK(H_kv > 0 && H_q % H_kv == 0, "gemma4_decode_attention: H_q must be a multiple of H_kv");
     TORCH_CHECK(k_c.size(0) == v_c.size(0) && k_c.size(3) == D && v_c.size(3) == D,
                 "gemma4_decode_attention: cache shape mismatch");
+    TORCH_CHECK(k_c.size(1) == v_c.size(1) && k_c.size(2) == v_c.size(2),
+                "gemma4_decode_attention: K/V cache shape mismatch");
     TORCH_CHECK(bt.size(0) == N && ctx.size(0) == N,
                 "gemma4_decode_attention: block_table/context_lens must have N rows");
     TORCH_CHECK(D <= 512, "gemma4_decode_attention: head_dim above 512 is not supported");
@@ -333,55 +451,52 @@ torch::Tensor gemma4_decode_attention(
     auto out = torch::empty_like(q_c);
     if (N == 0 || H_q == 0) return out;
 
-    // 段数按最长上下文确定，保证每个 head 的段数一致（merge 阶段好索引）
-    const int max_ctx = ctx.max().item<int>();
     const int win = (int)window_size;
-    const int eff = (win > 0) ? std::min(max_ctx, win) : max_ctx;
-    const int num_chunks = std::max(1, (eff + KV_CHUNK - 1) / KV_CHUNK);
-
-    auto opts_f = q_c.options().dtype(torch::kFloat32);
-    auto partial_o = torch::zeros({N, H_q, num_chunks, D}, opts_f);
-    auto partial_m = torch::full({N, H_q, num_chunks}, -std::numeric_limits<float>::infinity(), opts_f);
-    auto partial_l = torch::zeros({N, H_q, num_chunks}, opts_f);
-
-    const int block_dim = (D <= 128) ? 128 : 256;
-    dim3 grid_p((unsigned)N, (unsigned)H_q, (unsigned)num_chunks);
-    dim3 grid_m((unsigned)N, (unsigned)H_q);
-    const float scale = rsqrtf((float)D);
-
+    TORCH_CHECK(win >= 0, "gemma4_decode_attention: window_size must be non-negative");
+    TORCH_CHECK(D == 256 || D == 512,
+                "gemma4_decode_attention: expected head_dim 256 or 512");
+    TORCH_CHECK(ctx.numel() == 0 || ctx.max().item<int>() <=
+                    max_blocks * block_size,
+                "gemma4_decode_attention: context length exceeds block table capacity");
+    auto out = torch::empty_like(q_c);
+    const int block_dim = D == 512 ? 256 : 128;
+    dim3 grid((unsigned)N, (unsigned)H_q);
     const auto stream = at::cuda::getCurrentCUDAStream();
-
-#define G4_LAUNCH_PARTIAL(TYPE, BDIM)                                                   \
-    gemma4_attention_partial_kernel<TYPE, BDIM><<<grid_p, BDIM, 0, stream>>>(           \
-        reinterpret_cast<const TYPE*>(q_c.data_ptr()),                                  \
-        reinterpret_cast<const TYPE*>(k_c.data_ptr()),                                  \
-        reinterpret_cast<const TYPE*>(v_c.data_ptr()),                                  \
-        bt.data_ptr<int>(), ctx.data_ptr<int>(),                                        \
-        partial_o.data_ptr<float>(), partial_m.data_ptr<float>(), partial_l.data_ptr<float>(), \
-        H_q, H_kv, D, block_size, max_blocks, win, scale, num_chunks)
-
-#define G4_LAUNCH_MERGE(TYPE, BDIM)                                                     \
-    gemma4_attention_merge_kernel<TYPE, BDIM><<<grid_m, BDIM, 0, stream>>>(             \
-        partial_o.data_ptr<float>(), partial_m.data_ptr<float>(), partial_l.data_ptr<float>(), \
-        reinterpret_cast<TYPE*>(out.data_ptr()), N, H_q, D, num_chunks)
-
     if (q_c.dtype() == torch::kFloat16) {
-        if (block_dim == 128) { G4_LAUNCH_PARTIAL(__half, 128); }
-        else                  { G4_LAUNCH_PARTIAL(__half, 256); }
+        if (block_dim == 128)
+            gemma4_attention_safe_kernel<__half, 128><<<grid, 128, 0, stream>>>(
+                reinterpret_cast<const __half*>(q_c.data_ptr()),
+                reinterpret_cast<const __half*>(k_c.data_ptr()),
+                reinterpret_cast<const __half*>(v_c.data_ptr()),
+                bt.data_ptr<int>(), ctx.data_ptr<int>(),
+                reinterpret_cast<__half*>(out.data_ptr()),
+                H_q, H_kv, D, block_size, max_blocks, win);
+        else
+            gemma4_attention_safe_kernel<__half, 256><<<grid, 256, 0, stream>>>(
+                reinterpret_cast<const __half*>(q_c.data_ptr()),
+                reinterpret_cast<const __half*>(k_c.data_ptr()),
+                reinterpret_cast<const __half*>(v_c.data_ptr()),
+                bt.data_ptr<int>(), ctx.data_ptr<int>(),
+                reinterpret_cast<__half*>(out.data_ptr()),
+                H_q, H_kv, D, block_size, max_blocks, win);
     } else {
-        if (block_dim == 128) { G4_LAUNCH_PARTIAL(__nv_bfloat16, 128); }
-        else                  { G4_LAUNCH_PARTIAL(__nv_bfloat16, 256); }
+        if (block_dim == 128)
+            gemma4_attention_safe_kernel<__nv_bfloat16, 128><<<grid, 128, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(q_c.data_ptr()),
+                reinterpret_cast<const __nv_bfloat16*>(k_c.data_ptr()),
+                reinterpret_cast<const __nv_bfloat16*>(v_c.data_ptr()),
+                bt.data_ptr<int>(), ctx.data_ptr<int>(),
+                reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+                H_q, H_kv, D, block_size, max_blocks, win);
+        else
+            gemma4_attention_safe_kernel<__nv_bfloat16, 256><<<grid, 256, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(q_c.data_ptr()),
+                reinterpret_cast<const __nv_bfloat16*>(k_c.data_ptr()),
+                reinterpret_cast<const __nv_bfloat16*>(v_c.data_ptr()),
+                bt.data_ptr<int>(), ctx.data_ptr<int>(),
+                reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+                H_q, H_kv, D, block_size, max_blocks, win);
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    if (q_c.dtype() == torch::kFloat16) {
-        if (block_dim == 128) { G4_LAUNCH_MERGE(__half, 128); }
-        else                  { G4_LAUNCH_MERGE(__half, 256); }
-    } else {
-        if (block_dim == 128) { G4_LAUNCH_MERGE(__nv_bfloat16, 128); }
-        else                  { G4_LAUNCH_MERGE(__nv_bfloat16, 256); }
-    }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-#undef G4_LAUNCH_PARTIAL
-#undef G4_LAUNCH_MERGE
     return out;
 }

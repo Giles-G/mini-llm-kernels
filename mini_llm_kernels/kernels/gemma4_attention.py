@@ -90,33 +90,20 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 # CUDA 路径状态
 #
-# CUDA kernel 目前**不可用**：入口会挂死（见 csrc/gemma4_attention.cu 头部
-# 说明）。因此默认一律走下面这个逐位对齐的 PyTorch 实现。
-#
-# 这里刻意不在导入时"试跑一次"来探测——kernel 的问题正是会挂死，任何自动
-# 探测都会把进程一起挂住。修好 kernel 之后，把 _CUDA_ATTN_VERIFIED 改成
-# True（并跑通 tests 里的对照）即可放行；调试时也可以用环境变量
-# MINI_LLM_GEMMA4_ATTN_KERNEL=1 临时强制启用。
+# CUDA kernel remains disabled until an RTX 3060 parity test has passed.
+# An unverified native kernel must not be force-enabled through an environment
+# variable because a serving process cannot safely recover from a GPU hang.
 # ─────────────────────────────────────────────────────────────────────────────
 _CUDA_ATTN_VERIFIED = False          # kernel 修好并通过对照测试后改为 True
-_FORCE_ENV = "MINI_LLM_GEMMA4_ATTN_KERNEL"
 
 
 def cuda_attention_usable() -> bool:
-    """是否可以用 Gemma4 CUDA attention kernel（当前恒为 False）。"""
-    import os
-
-    if os.environ.get(_FORCE_ENV) == "1":
-        return bool(_HAS_GEMMA4_ATTN and torch.cuda.is_available())
+    """是否可以使用已通过 parity 的 Gemma4 CUDA attention kernel。"""
     return bool(_CUDA_ATTN_VERIFIED and _HAS_GEMMA4_ATTN and torch.cuda.is_available())
 
 
 def cuda_attention_status() -> str:
     """CUDA 路径被启用/禁用的原因，便于日志与排查。"""
-    import os
-
-    if os.environ.get(_FORCE_ENV) == "1":
-        return "enabled by MINI_LLM_GEMMA4_ATTN_KERNEL=1 (unverified, may hang)"
     if not _HAS_GEMMA4_ATTN:
         return "disabled: CUDA extension symbol not built"
     if not _CUDA_ATTN_VERIFIED:

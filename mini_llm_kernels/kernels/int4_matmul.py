@@ -77,6 +77,6 @@ def int4_dequant_matmul(
     """
     K = x.shape[-1]
     group_size = K // group_scales.shape[1]
-    if _HAS_INT4_CUDA and x.is_cuda:
+    if _HAS_INT4_CUDA and x.is_cuda and group_size == 64:
         return _cuda_int4_matmul(x, w_packed, group_scales, group_size)
     return _int4_dequant_matmul_pytorch(x, w_packed, group_scales)
