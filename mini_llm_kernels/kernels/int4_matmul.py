@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+import os
 
 
 def _int4_dequant_matmul_pytorch(
@@ -55,8 +56,11 @@ def _int4_dequant_matmul_pytorch(
 # Runtime selection
 try:
     from mini_llm_kernels._C import int4_dequant_matmul as _cuda_int4_matmul
+    from mini_llm_kernels._C import int4_dequant_matmul_legacy as _cuda_int4_matmul_legacy
     _HAS_INT4_CUDA = True
 except ImportError:
+    _cuda_int4_matmul = None
+    _cuda_int4_matmul_legacy = None
     _HAS_INT4_CUDA = False
 
 
@@ -77,6 +81,12 @@ def int4_dequant_matmul(
     """
     K = x.shape[-1]
     group_size = K // group_scales.shape[1]
+    impl = os.environ.get("MINI_LLM_INT4_IMPL", "legacy").strip().lower()
+    if impl not in {"legacy", "warp"}:
+        raise ValueError(
+            "MINI_LLM_INT4_IMPL must be one of: legacy, warp"
+        )
     if _HAS_INT4_CUDA and x.is_cuda and group_size == 64:
-        return _cuda_int4_matmul(x, w_packed, group_scales, group_size)
+        kernel = _cuda_int4_matmul_legacy if impl == "legacy" else _cuda_int4_matmul
+        return kernel(x, w_packed, group_scales, group_size)
     return _int4_dequant_matmul_pytorch(x, w_packed, group_scales)
