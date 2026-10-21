@@ -38,6 +38,7 @@ if cuda_available():
                 "csrc/prefill_attention.cu",
                 "csrc/int4_matmul.cu",
                 "csrc/gemma4_attention.cu",
+                "csrc/gemma4_rope.cu",
             ],
             include_dirs=["csrc"],
             extra_compile_args={

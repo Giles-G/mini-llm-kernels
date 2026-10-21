@@ -404,6 +404,477 @@ __global__ void gemma4_attention_safe_kernel(
     }
 }
 
+// Warp-parallel long-context kernel. One block owns one (request, q-head)
+// and splits the visible KV range across WARPS warps. Each warp keeps its own
+// online-softmax state and FP32 output accumulation, so the hot loop has no
+// per-token __syncthreads; only one merge/barrier at the end.
+template<typename T, int WARPS, int MAX_D>
+__global__ void gemma4_attention_warp_split_kernel(
+    const T* __restrict__ q,
+    const T* __restrict__ k_cache,
+    const T* __restrict__ v_cache,
+    const int* __restrict__ block_table,
+    const int* __restrict__ context_lens,
+    T* __restrict__ out,
+    int h_q,
+    int h_kv,
+    int d,
+    int block_size,
+    int max_blocks,
+    int window_size)
+{
+    constexpr int BLOCK_DIM = WARPS * 32;
+    const int request = blockIdx.x;
+    const int q_head = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int kv_head = q_head / (h_q / h_kv);
+    const int context_len = context_lens[request];
+    const int start = window_size > 0 ? max(0, context_len - window_size) : 0;
+
+    const T* q_row = q + ((long long)request * h_q + q_head) * d;
+    T* out_row = out + ((long long)request * h_q + q_head) * d;
+
+    float q_reg[MAX_D];
+    float acc[MAX_D];
+    #pragma unroll
+    for (int j = 0; j < MAX_D; ++j) {
+        const int dim = lane + j * 32;
+        q_reg[j] = dim < d ? g4_to_float(q_row[dim]) : 0.0f;
+        acc[j] = 0.0f;
+    }
+
+    float m = -FLT_MAX;
+    float l = 0.0f;
+    // Warp w owns positions start+w, start+w+WARPS, ...; all lanes in the
+    // warp execute the same number of iterations.
+    for (int logical = start + warp; logical < context_len; logical += WARPS) {
+        const int physical_block =
+            block_table[(long long)request * max_blocks + logical / block_size];
+        const int slot = logical % block_size;
+        const T* k_row = k_cache +
+            (((long long)physical_block * block_size + slot) * h_kv + kv_head) * d;
+        const T* v_row = v_cache +
+            (((long long)physical_block * block_size + slot) * h_kv + kv_head) * d;
+
+        float dot = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < MAX_D; ++j) {
+            const int dim = lane + j * 32;
+            if (dim < d) dot += q_reg[j] * g4_to_float(k_row[dim]);
+        }
+        dot = g4_warp_sum(dot);
+        const float new_m = fmaxf(m, dot);
+        const float old_factor = m == -FLT_MAX ? 0.0f : expf(m - new_m);
+        const float current = expf(dot - new_m);
+        l = old_factor * l + current;
+        #pragma unroll
+        for (int j = 0; j < MAX_D; ++j) {
+            const int dim = lane + j * 32;
+            if (dim < d) {
+                acc[j] = old_factor * acc[j] + current * g4_to_float(v_row[dim]);
+            }
+        }
+        m = new_m;
+    }
+
+    __shared__ float sm_m[WARPS];
+    __shared__ float sm_l[WARPS];
+    __shared__ float sm_o[WARPS][512];
+    #pragma unroll
+    for (int j = 0; j < MAX_D; ++j) {
+        const int dim = lane + j * 32;
+        if (dim < d) sm_o[warp][dim] = acc[j];
+    }
+    if (lane == 0) {
+        sm_m[warp] = m;
+        sm_l[warp] = l;
+    }
+    __syncthreads();
+
+    float global_m = -FLT_MAX;
+    #pragma unroll
+    for (int w = 0; w < WARPS; ++w) global_m = fmaxf(global_m, sm_m[w]);
+    float global_l = 0.0f;
+    #pragma unroll
+    for (int w = 0; w < WARPS; ++w) {
+        global_l += sm_l[w] * expf(sm_m[w] - global_m);
+    }
+    const float inv_l = global_l > 0.0f ? 1.0f / global_l : 0.0f;
+    #pragma unroll
+    for (int j = 0; j < MAX_D; ++j) {
+        const int dim = tid + j * BLOCK_DIM;
+        if (dim < d) {
+            float sum = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < WARPS; ++w) {
+                sum += sm_o[w][dim] * expf(sm_m[w] - global_m);
+            }
+            out_row[dim] = g4_from_float<T>(sum * inv_l);
+        }
+    }
+}
+
+torch::Tensor gemma4_decode_attention_warpsplit(
+    torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache,
+    torch::Tensor block_table, torch::Tensor context_lens,
+    int64_t window_size)
+{
+    TORCH_CHECK(q.is_cuda() && k_cache.is_cuda() && v_cache.is_cuda(),
+                "warpsplit: q/k/v must be CUDA");
+    TORCH_CHECK(block_table.is_cuda() && context_lens.is_cuda(),
+                "warpsplit: metadata must be CUDA");
+    TORCH_CHECK(q.dtype() == torch::kFloat16 || q.dtype() == torch::kBFloat16,
+                "warpsplit: q must be fp16/bf16");
+    TORCH_CHECK(k_cache.dtype() == q.dtype() && v_cache.dtype() == q.dtype(),
+                "warpsplit: cache dtype must match q");
+    auto q_c = q.contiguous();
+    auto k_c = k_cache.contiguous();
+    auto v_c = v_cache.contiguous();
+    auto bt = block_table.to(torch::kInt32).contiguous();
+    auto ctx = context_lens.to(torch::kInt32).contiguous();
+    const int N = (int)q_c.size(0);
+    const int H_q = (int)q_c.size(1);
+    const int D = (int)q_c.size(2);
+    const int H_kv = (int)k_c.size(2);
+    const int block_size = (int)k_c.size(1);
+    const int max_blocks = (int)bt.size(1);
+    TORCH_CHECK(H_kv > 0 && H_q % H_kv == 0, "warpsplit: bad GQA");
+    TORCH_CHECK(D == 256 || D == 512, "warpsplit: D must be 256/512");
+    TORCH_CHECK(k_c.size(0) == v_c.size(0) && k_c.size(3) == D &&
+                    v_c.size(3) == D && k_c.size(1) == v_c.size(1) &&
+                    k_c.size(2) == v_c.size(2),
+                "warpsplit: cache shape mismatch");
+    TORCH_CHECK(bt.size(0) == N && ctx.size(0) == N,
+                "warpsplit: metadata row mismatch");
+    auto out = torch::empty_like(q_c);
+    if (N == 0 || H_q == 0) return out;
+    const int win = (int)window_size;
+    TORCH_CHECK(win >= 0, "warpsplit: window must be non-negative");
+    constexpr int WARPS = 8;
+    dim3 grid((unsigned)N, (unsigned)H_q);
+    const auto stream = at::cuda::getCurrentCUDAStream();
+    if (!stream.is_capturing()) {
+        TORCH_CHECK(ctx.numel() == 0 || ctx.max().item<int>() <=
+                        max_blocks * block_size,
+                    "warpsplit: context exceeds block table capacity");
+    }
+    if (q_c.dtype() == torch::kFloat16) {
+        if (D == 512)
+            gemma4_attention_warp_split_kernel<__half, WARPS, 16>
+                <<<grid, WARPS * 32, 0, stream>>>(
+                    (const __half*)q_c.data_ptr(), (const __half*)k_c.data_ptr(),
+                    (const __half*)v_c.data_ptr(), bt.data_ptr<int>(),
+                    ctx.data_ptr<int>(), (__half*)out.data_ptr(),
+                    H_q, H_kv, D, block_size, max_blocks, win);
+        else
+            gemma4_attention_warp_split_kernel<__half, WARPS, 8>
+                <<<grid, WARPS * 32, 0, stream>>>(
+                    (const __half*)q_c.data_ptr(), (const __half*)k_c.data_ptr(),
+                    (const __half*)v_c.data_ptr(), bt.data_ptr<int>(),
+                    ctx.data_ptr<int>(), (__half*)out.data_ptr(),
+                    H_q, H_kv, D, block_size, max_blocks, win);
+    } else {
+        if (D == 512)
+            gemma4_attention_warp_split_kernel<__nv_bfloat16, WARPS, 16>
+                <<<grid, WARPS * 32, 0, stream>>>(
+                    (const __nv_bfloat16*)q_c.data_ptr(), (const __nv_bfloat16*)k_c.data_ptr(),
+                    (const __nv_bfloat16*)v_c.data_ptr(), bt.data_ptr<int>(),
+                    ctx.data_ptr<int>(), (__nv_bfloat16*)out.data_ptr(),
+                    H_q, H_kv, D, block_size, max_blocks, win);
+        else
+            gemma4_attention_warp_split_kernel<__nv_bfloat16, WARPS, 8>
+                <<<grid, WARPS * 32, 0, stream>>>(
+                    (const __nv_bfloat16*)q_c.data_ptr(), (const __nv_bfloat16*)k_c.data_ptr(),
+                    (const __nv_bfloat16*)v_c.data_ptr(), bt.data_ptr<int>(),
+                    ctx.data_ptr<int>(), (__nv_bfloat16*)out.data_ptr(),
+                    H_q, H_kv, D, block_size, max_blocks, win);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+// Global split-K variant for long contexts. Each block owns one KV chunk of
+// one (request, q-head), so a 4k context exposes Hq * chunks blocks to the
+// SMs instead of only Hq blocks. A small merge kernel combines the FP32
+// partial softmax states.
+template<typename T, int WARPS, int MAX_D>
+__global__ void gemma4_attention_partial_chunk_kernel(
+    const T* __restrict__ q,
+    const T* __restrict__ k_cache,
+    const T* __restrict__ v_cache,
+    const int* __restrict__ block_table,
+    const int* __restrict__ context_lens,
+    float* __restrict__ partial_o,
+    float* __restrict__ partial_m,
+    float* __restrict__ partial_l,
+    int h_q, int h_kv, int d, int block_size, int max_blocks,
+    int window_size, int num_chunks, int chunk_size)
+{
+    constexpr int BLOCK_DIM = WARPS * 32;
+    const int request = blockIdx.x;
+    const int q_head = blockIdx.y;
+    const int chunk = blockIdx.z;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int kv_head = q_head / (h_q / h_kv);
+    const int context_len = context_lens[request];
+    const int start = window_size > 0 ? max(0, context_len - window_size) : 0;
+    const int visible = max(0, context_len - start);
+    const int local_begin = chunk * chunk_size;
+    const int local_end = min(visible, local_begin + chunk_size);
+
+    const T* q_row = q + ((long long)request * h_q + q_head) * d;
+    float q_reg[MAX_D];
+    float acc[MAX_D];
+    #pragma unroll
+    for (int j = 0; j < MAX_D; ++j) {
+        const int dim = lane + j * 32;
+        q_reg[j] = dim < d ? g4_to_float(q_row[dim]) : 0.0f;
+        acc[j] = 0.0f;
+    }
+
+    float m = -FLT_MAX;
+    float l = 0.0f;
+    for (int local = local_begin + warp; local < local_end; local += WARPS) {
+        const int logical = start + local;
+        const int physical_block =
+            block_table[(long long)request * max_blocks + logical / block_size];
+        const int slot = logical % block_size;
+        const T* k_row = k_cache +
+            (((long long)physical_block * block_size + slot) * h_kv + kv_head) * d;
+        const T* v_row = v_cache +
+            (((long long)physical_block * block_size + slot) * h_kv + kv_head) * d;
+        float dot = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < MAX_D; ++j) {
+            const int dim = lane + j * 32;
+            if (dim < d) dot += q_reg[j] * g4_to_float(k_row[dim]);
+        }
+        dot = g4_warp_sum(dot);
+        const float new_m = fmaxf(m, dot);
+        const float old_factor = m == -FLT_MAX ? 0.0f : expf(m - new_m);
+        const float current = expf(dot - new_m);
+        l = old_factor * l + current;
+        #pragma unroll
+        for (int j = 0; j < MAX_D; ++j) {
+            const int dim = lane + j * 32;
+            if (dim < d) {
+                acc[j] = old_factor * acc[j] + current * g4_to_float(v_row[dim]);
+            }
+        }
+        m = new_m;
+    }
+
+    // Merge the 8 warp-local softmax states once per chunk. The previous
+    // version wrote every warp's accumulator to the same partial slot.
+    __shared__ float sm_m[WARPS];
+    __shared__ float sm_l[WARPS];
+    __shared__ float sm_o[WARPS][512];
+    #pragma unroll
+    for (int j = 0; j < MAX_D; ++j) {
+        const int dim = lane + j * 32;
+        if (dim < d) sm_o[warp][dim] = acc[j];
+    }
+    if (lane == 0) {
+        sm_m[warp] = m;
+        sm_l[warp] = l;
+    }
+    __syncthreads();
+
+    float global_m = -FLT_MAX;
+    #pragma unroll
+    for (int w = 0; w < WARPS; ++w) global_m = fmaxf(global_m, sm_m[w]);
+    float global_l = 0.0f;
+    #pragma unroll
+    for (int w = 0; w < WARPS; ++w) {
+        global_l += sm_l[w] * expf(sm_m[w] - global_m);
+    }
+    const float inv_l = global_l > 0.0f ? 1.0f / global_l : 0.0f;
+    const long long base = ((long long)request * h_q + q_head) * num_chunks + chunk;
+    float* o_out = partial_o + base * d;
+    #pragma unroll
+    for (int j = 0; j < MAX_D; ++j) {
+        const int dim = tid + j * BLOCK_DIM;
+        if (dim < d) {
+            float sum = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < WARPS; ++w) {
+                sum += sm_o[w][dim] * expf(sm_m[w] - global_m);
+            }
+            o_out[dim] = sum;
+        }
+    }
+    if (tid == 0) {
+        partial_m[base] = global_l > 0.0f ? global_m : 0.0f;
+        partial_l[base] = global_l;
+    }
+}
+
+template<typename T, int MAX_D>
+__global__ void gemma4_attention_merge_chunks_kernel(
+    const float* __restrict__ partial_o,
+    const float* __restrict__ partial_m,
+    const float* __restrict__ partial_l,
+    T* __restrict__ out,
+    int h_q, int d, int num_chunks)
+{
+    const int request = blockIdx.x;
+    const int q_head = blockIdx.y;
+    const int tid = threadIdx.x;
+    constexpr int BLOCK_DIM = 256;
+    const long long head_base = ((long long)request * h_q + q_head) * num_chunks;
+
+    float global_m = -FLT_MAX;
+    for (int c = 0; c < num_chunks; ++c) {
+        global_m = fmaxf(global_m, partial_m[head_base + c]);
+    }
+    float global_l = 0.0f;
+    for (int c = 0; c < num_chunks; ++c) {
+        global_l += partial_l[head_base + c] *
+            expf(partial_m[head_base + c] - global_m);
+    }
+    const float inv_l = global_l > 0.0f ? 1.0f / global_l : 0.0f;
+    T* out_row = out + ((long long)request * h_q + q_head) * d;
+    #pragma unroll
+    for (int j = 0; j < MAX_D; ++j) {
+        const int dim = tid + j * BLOCK_DIM;
+        if (dim < d) {
+            float sum = 0.0f;
+            for (int c = 0; c < num_chunks; ++c) {
+                const long long base = ((long long)request * h_q + q_head) *
+                    num_chunks * d + (long long)c * d;
+                sum += partial_o[base + dim] *
+                    expf(partial_m[head_base + c] - global_m);
+            }
+            out_row[dim] = g4_from_float<T>(sum * inv_l);
+        }
+    }
+}
+
+torch::Tensor gemma4_decode_attention_splitk(
+    torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache,
+    torch::Tensor block_table, torch::Tensor context_lens,
+    int64_t window_size, torch::Tensor partial_o,
+    torch::Tensor partial_m, torch::Tensor partial_l,
+    int64_t chunk_size)
+{
+    TORCH_CHECK(q.is_cuda() && k_cache.is_cuda() && v_cache.is_cuda(),
+                "splitk: q/k/v must be CUDA");
+    TORCH_CHECK(block_table.is_cuda() && context_lens.is_cuda(),
+                "splitk: metadata must be CUDA");
+    TORCH_CHECK(q.dtype() == torch::kFloat16 || q.dtype() == torch::kBFloat16,
+                "splitk: q must be fp16/bf16");
+    TORCH_CHECK(k_cache.dtype() == q.dtype() && v_cache.dtype() == q.dtype(),
+                "splitk: cache dtype mismatch");
+    TORCH_CHECK(partial_o.is_cuda() && partial_o.dtype() == torch::kFloat32 &&
+                    partial_o.is_contiguous(),
+                "splitk: partial_o must be contiguous fp32 CUDA");
+    TORCH_CHECK(partial_m.is_cuda() && partial_m.dtype() == torch::kFloat32 &&
+                    partial_l.is_cuda() && partial_l.dtype() == torch::kFloat32,
+                "splitk: partial m/l must be fp32 CUDA");
+    auto q_c = q.contiguous();
+    auto k_c = k_cache.contiguous();
+    auto v_c = v_cache.contiguous();
+    auto bt = block_table.to(torch::kInt32).contiguous();
+    auto ctx = context_lens.to(torch::kInt32).contiguous();
+    const int N = (int)q_c.size(0);
+    const int H_q = (int)q_c.size(1);
+    const int D = (int)q_c.size(2);
+    const int H_kv = (int)k_c.size(2);
+    const int block_size = (int)k_c.size(1);
+    const int max_blocks = (int)bt.size(1);
+    const int num_chunks = (int)partial_o.size(2);
+    TORCH_CHECK(H_kv > 0 && H_q % H_kv == 0, "splitk: bad GQA");
+    TORCH_CHECK(D == 256 || D == 512, "splitk: D must be 256/512");
+    TORCH_CHECK(k_c.size(0) == v_c.size(0) && k_c.size(3) == D &&
+                    v_c.size(3) == D && k_c.size(1) == v_c.size(1) &&
+                    k_c.size(2) == v_c.size(2),
+                "splitk: cache shape mismatch");
+    TORCH_CHECK(partial_o.size(0) == N && partial_o.size(1) == H_q &&
+                    partial_o.size(3) == D,
+                "splitk: partial_o shape mismatch");
+    TORCH_CHECK(partial_m.size(0) == N && partial_m.size(1) == H_q &&
+                    partial_m.size(2) == num_chunks &&
+                    partial_l.sizes() == partial_m.sizes(),
+                "splitk: partial m/l shape mismatch");
+    TORCH_CHECK(chunk_size > 0, "splitk: chunk_size must be positive");
+    auto out = torch::empty_like(q_c);
+    if (N == 0 || H_q == 0) return out;
+    const int win = (int)window_size;
+    TORCH_CHECK(win >= 0, "splitk: window must be non-negative");
+    constexpr int WARPS = 8;
+    dim3 pgrid((unsigned)N, (unsigned)H_q, (unsigned)num_chunks);
+    dim3 mgrid((unsigned)N, (unsigned)H_q);
+    const auto stream = at::cuda::getCurrentCUDAStream();
+    if (!stream.is_capturing()) {
+        TORCH_CHECK(ctx.numel() == 0 || ctx.max().item<int>() <=
+                        (long long)num_chunks * chunk_size,
+                    "splitk: context exceeds scratch capacity");
+    }
+    if (q_c.dtype() == torch::kFloat16) {
+        if (D == 512) {
+            gemma4_attention_partial_chunk_kernel<__half, WARPS, 16>
+                <<<pgrid, WARPS * 32, 0, stream>>>(
+                    (const __half*)q_c.data_ptr(), (const __half*)k_c.data_ptr(),
+                    (const __half*)v_c.data_ptr(), bt.data_ptr<int>(),
+                    ctx.data_ptr<int>(), partial_o.data_ptr<float>(),
+                    partial_m.data_ptr<float>(), partial_l.data_ptr<float>(),
+                    H_q, H_kv, D, block_size, max_blocks, win, num_chunks,
+                    (int)chunk_size);
+            gemma4_attention_merge_chunks_kernel<__half, 16><<<mgrid, 256, 0, stream>>>(
+                partial_o.data_ptr<float>(), partial_m.data_ptr<float>(),
+                partial_l.data_ptr<float>(), (__half*)out.data_ptr(), H_q, D,
+                num_chunks);
+        } else {
+            gemma4_attention_partial_chunk_kernel<__half, WARPS, 8>
+                <<<pgrid, WARPS * 32, 0, stream>>>(
+                    (const __half*)q_c.data_ptr(), (const __half*)k_c.data_ptr(),
+                    (const __half*)v_c.data_ptr(), bt.data_ptr<int>(),
+                    ctx.data_ptr<int>(), partial_o.data_ptr<float>(),
+                    partial_m.data_ptr<float>(), partial_l.data_ptr<float>(),
+                    H_q, H_kv, D, block_size, max_blocks, win, num_chunks,
+                    (int)chunk_size);
+            gemma4_attention_merge_chunks_kernel<__half, 8><<<mgrid, 256, 0, stream>>>(
+                partial_o.data_ptr<float>(), partial_m.data_ptr<float>(),
+                partial_l.data_ptr<float>(), (__half*)out.data_ptr(), H_q, D,
+                num_chunks);
+        }
+    } else {
+        if (D == 512) {
+            gemma4_attention_partial_chunk_kernel<__nv_bfloat16, WARPS, 16>
+                <<<pgrid, WARPS * 32, 0, stream>>>(
+                    (const __nv_bfloat16*)q_c.data_ptr(), (const __nv_bfloat16*)k_c.data_ptr(),
+                    (const __nv_bfloat16*)v_c.data_ptr(), bt.data_ptr<int>(),
+                    ctx.data_ptr<int>(), partial_o.data_ptr<float>(),
+                    partial_m.data_ptr<float>(), partial_l.data_ptr<float>(),
+                    H_q, H_kv, D, block_size, max_blocks, win, num_chunks,
+                    (int)chunk_size);
+            gemma4_attention_merge_chunks_kernel<__nv_bfloat16, 16><<<mgrid, 256, 0, stream>>>(
+                partial_o.data_ptr<float>(), partial_m.data_ptr<float>(),
+                partial_l.data_ptr<float>(), (__nv_bfloat16*)out.data_ptr(), H_q, D,
+                num_chunks);
+        } else {
+            gemma4_attention_partial_chunk_kernel<__nv_bfloat16, WARPS, 8>
+                <<<pgrid, WARPS * 32, 0, stream>>>(
+                    (const __nv_bfloat16*)q_c.data_ptr(), (const __nv_bfloat16*)k_c.data_ptr(),
+                    (const __nv_bfloat16*)v_c.data_ptr(), bt.data_ptr<int>(),
+                    ctx.data_ptr<int>(), partial_o.data_ptr<float>(),
+                    partial_m.data_ptr<float>(), partial_l.data_ptr<float>(),
+                    H_q, H_kv, D, block_size, max_blocks, win, num_chunks,
+                    (int)chunk_size);
+            gemma4_attention_merge_chunks_kernel<__nv_bfloat16, 8><<<mgrid, 256, 0, stream>>>(
+                partial_o.data_ptr<float>(), partial_m.data_ptr<float>(),
+                partial_l.data_ptr<float>(), (__nv_bfloat16*)out.data_ptr(), H_q, D,
+                num_chunks);
+        }
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Python 绑定
 // ─────────────────────────────────────────────────────────────────────────────
@@ -460,13 +931,17 @@ torch::Tensor gemma4_decode_attention(
     TORCH_CHECK(win >= 0, "gemma4_decode_attention: window_size must be non-negative");
     TORCH_CHECK(D == 256 || D == 512,
                 "gemma4_decode_attention: expected head_dim 256 or 512");
-    TORCH_CHECK(ctx.numel() == 0 || ctx.max().item<int>() <=
-                    max_blocks * block_size,
-                "gemma4_decode_attention: context length exceeds block table capacity");
-    auto out = torch::empty_like(q_c);
     const int block_dim = D == 512 ? 256 : 128;
     dim3 grid((unsigned)N, (unsigned)H_q);
     const auto stream = at::cuda::getCurrentCUDAStream();
+    // ctx.max().item() synchronizes the host; skip it while the stream is
+    // being captured into a CUDA graph. The bounds are still checked by the
+    // non-captured path and the kernel itself only reads the visible range.
+    if (!stream.is_capturing()) {
+        TORCH_CHECK(ctx.numel() == 0 || ctx.max().item<int>() <=
+                        max_blocks * block_size,
+                    "gemma4_decode_attention: context length exceeds block table capacity");
+    }
     if (q_c.dtype() == torch::kFloat16) {
         if (block_dim == 128)
             gemma4_attention_safe_kernel<__half, 128><<<grid, 128, 0, stream>>>(

@@ -29,7 +29,11 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 辅助：half / bfloat16 → float 互转
@@ -160,21 +164,30 @@ std::pair<torch::Tensor, torch::Tensor> fused_add_rms_norm(
     TORCH_CHECK(x.dtype() == gamma.dtype(),    "x and gamma must have same dtype");
     TORCH_CHECK(x.dtype() == torch::kFloat16 || x.dtype() == torch::kBFloat16,
                 "only fp16 / bf16 supported");
+    TORCH_CHECK(residual.device() == x.device() && gamma.device() == x.device(),
+                "x, residual, and gamma must be on the same device");
+    TORCH_CHECK(x.is_contiguous() && residual.is_contiguous() && gamma.is_contiguous(),
+                "x, residual, and gamma must be contiguous");
+    TORCH_CHECK(gamma.dim() == 1 && gamma.size(0) == x.size(1),
+                "gamma must have shape [H]");
 
+    const c10::cuda::CUDAGuard device_guard(x.device());
     int N = x.size(0);
     int H = x.size(1);
 
     auto x_normed     = torch::empty_like(x);
     auto residual_out = torch::empty_like(x);
+    if (N == 0 || H == 0) return {x_normed, residual_out};
 
     int threads = std::min(H, 1024);
     // 向上对齐到 32（warp 大小）
     threads = ((threads + 31) / 32) * 32;
     int num_warps = threads / 32;
     int smem_bytes = (num_warps + H) * sizeof(float);  // reduce + val buffer
+    const auto stream = at::cuda::getCurrentCUDAStream();
 
     if (x.dtype() == torch::kFloat16) {
-        fused_add_rms_norm_kernel<__half><<<N, threads, smem_bytes>>>(
+        fused_add_rms_norm_kernel<__half><<<N, threads, smem_bytes, stream>>>(
             reinterpret_cast<const __half*>(x.data_ptr()),
             reinterpret_cast<const __half*>(residual.data_ptr()),
             reinterpret_cast<const __half*>(gamma.data_ptr()),
@@ -183,7 +196,7 @@ std::pair<torch::Tensor, torch::Tensor> fused_add_rms_norm(
             N, H, eps
         );
     } else {
-        fused_add_rms_norm_kernel<__nv_bfloat16><<<N, threads, smem_bytes>>>(
+        fused_add_rms_norm_kernel<__nv_bfloat16><<<N, threads, smem_bytes, stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
             reinterpret_cast<const __nv_bfloat16*>(residual.data_ptr()),
             reinterpret_cast<const __nv_bfloat16*>(gamma.data_ptr()),
@@ -192,6 +205,7 @@ std::pair<torch::Tensor, torch::Tensor> fused_add_rms_norm(
             N, H, eps
         );
     }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     return {x_normed, residual_out};
 }

@@ -69,11 +69,16 @@ def _gemma4_decode_attention_pytorch(
 
         # [T, H, D] -> [H, T, D]：把 head 轴换到前面，避免 head 数与 head_dim
         # 不等时 transpose 交换错轴。
-        k = k.transpose(0, 1)
-        v = v.transpose(0, 1)
-        scores = torch.matmul(q[row].unsqueeze(1), k.transpose(-1, -2)).float()
-        probs = torch.softmax(scores, dim=-1).to(v.dtype)
-        outputs.append(torch.matmul(probs, v).squeeze(1))
+        k = k.transpose(0, 1).float()
+        v = v.transpose(0, 1).float()
+        # True FP32 reference: the previous version ran the q·k and p·v
+        # matmuls in FP16, which diverged from exact math at large logits and
+        # made a correct kernel look wrong by ~0.06.
+        scores = torch.matmul(q[row].unsqueeze(1).float(), k.transpose(-1, -2))
+        probs = torch.softmax(scores, dim=-1)
+        outputs.append(
+            torch.matmul(probs, v).squeeze(1).to(q.dtype)
+        )
 
     return torch.stack(outputs, dim=0)
 
@@ -90,11 +95,12 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 # CUDA 路径状态
 #
-# CUDA kernel remains disabled until an RTX 3060 parity test has passed.
-# An unverified native kernel must not be force-enabled through an environment
-# variable because a serving process cannot safely recover from a GPU hang.
+# The warp-split kernel passed the parity matrix (D=256/512, GQA, block sizes,
+# contexts 1..4096, windows, FP16/BF16) and full-model checks. It is the server
+# default; the per-token safe kernel remains available with
+# MINI_LLM_GEMMA4_ATTN_IMPL=safe.
 # ─────────────────────────────────────────────────────────────────────────────
-_CUDA_ATTN_VERIFIED = False          # kernel 修好并通过对照测试后改为 True
+_CUDA_ATTN_VERIFIED = True
 
 
 def cuda_attention_usable() -> bool:
@@ -107,8 +113,8 @@ def cuda_attention_status() -> str:
     if not _HAS_GEMMA4_ATTN:
         return "disabled: CUDA extension symbol not built"
     if not _CUDA_ATTN_VERIFIED:
-        return "disabled: kernel is not verified yet (hangs); using PyTorch fallback"
-    return "enabled"
+        return "disabled: kernel has not passed the parity suite"
+    return "enabled: warp-split paged kernel (safe fallback; D=256/512, GQA, window)"
 
 
 def gemma4_decode_attention(
